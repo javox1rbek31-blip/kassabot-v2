@@ -2,7 +2,7 @@
 import os
 import logging
 import datetime as dt
-from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as K
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup as K
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, MessageHandler,
                           ChatMemberHandler, ContextTypes, filters)
 import logic as L
@@ -11,37 +11,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("kassabot")
 
 TOKEN = os.environ["BOT_TOKEN"]
-OWNER = 8785896869
+OWNER = int(os.getenv("OWNER_ID", "8785896869"))
 
-REPORT_TIME = os.getenv("REPORT_TIME", "23:30")
 
-PERIODS = [("Сегодня", "td"), ("Вчера", "yd"), ("Эта неделя", "tw"), ("Прошлая неделя", "lw")]
+def B(text, data):
+    return InlineKeyboardButton(text, callback_data=data)
+
 
 def is_staff(uid):
-    return uid == OWNER or uid in L.admins()
+    return uid is not None and (uid == OWNER or uid in L.admins())
+
 
 def staff_ids():
     return [OWNER] + [a for a in L.admins() if a != OWNER]
 
+
 def menu_btn():
     return [B("🔙 Меню", "m:main")]
 
+
 def period_rows(prefix):
     return [
-        [B(PERIODS[0][0], f"{prefix}:td"), B(PERIODS[1][0], f"{prefix}:yd")],
-        [B(PERIODS[2][0], f"{prefix}:tw"), B(PERIODS[3][0], f"{prefix}:lw")],
-        [B("📅 С даты по дату", f"{prefix}:custom")],
+        [B("Сегодня", f"{prefix}:td"), B("Вчера", f"{prefix}:yd")],
+        [B("Эта неделя", f"{prefix}:tw"), B("Прошлая неделя", f"{prefix}:lw")],
+        [B("Этот месяц", f"{prefix}:tm"), B("Прошлый месяц", f"{prefix}:lm")],
         [B("🔙 Меню", "m:main")]
     ]
 
+
 async def send(bot, chat_id, text, kb=None):
+    parts = L.chunks(text)
     last = None
-    for part in L.chunks(text):
+    for i, part in enumerate(parts):
         try:
-            last = await bot.send_message(chat_id, part, reply_markup=kb)
+            last = await bot.send_message(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None)
         except Exception as e:
             log.warning("send to %s failed: %s", chat_id, e)
     return last
+
 
 async def edit(q, text, kb=None):
     try:
@@ -50,18 +57,21 @@ async def edit(q, text, kb=None):
         if "not modified" not in str(e).lower():
             log.warning("edit failed: %s", e)
 
+
 def main_kb():
     return K([
         [B("📊 Отчёты", "rs:menu"), B("🏆 Рейтинг", "rt:menu")],
         [B("👥 Abrabotchiklar", "w:list"), B("💲 Прайс", "pr:menu")],
-        [B("💬 Чаты", "ch:menu"), B(f"❓ Вопросы", "q:list")]
+        [B("💬 Чаты", "ch:menu"), B("❓ Вопросы", "q:list")]
     ])
+
 
 def worker_menu_kb():
     return K([
-        [B("📥 Мой отчёт (Период)", "me:menu")],
+        [B("📥 Мой отчёт (период)", "me:menu")],
         [B("💰 Мой баланс", "me:balance")]
     ])
+
 
 async def send_overall(bot, chat_id, s, e, kb=None):
     res = L.calc(s, e)
@@ -69,9 +79,12 @@ async def send_overall(bot, chat_id, s, e, kb=None):
     await send(bot, chat_id, L.overall_text(res, lab))
     await send(bot, chat_id, L.rating_text(res, lab), kb)
 
+
 async def finalize(app, rid):
     L.x("update reports set status='done' where id=?", (rid,))
     r = L.report(rid)
+    if r is None:
+        return
     wid = r["worker_id"]
     for d in L.report_days(rid):
         day = dt.date.fromisoformat(d)
@@ -83,13 +96,16 @@ async def finalize(app, rid):
             await send(app.bot, sid, L.explain(res[0], lab))
             await send(app.bot, sid, L.clean_report(res[0], lab))
 
+
 async def advance(app, rid):
     need = L.report_needs(rid)
+    r = L.report(rid)
+    if r is None:
+        return
     if need is None:
         await finalize(app, rid)
         return
     kind, arg = need
-    r = L.report(rid)
     snippet = (r["raw"] or "")[:350]
     if kind == "worker":
         rows = [[B(w["name"], f"pw:{rid}:{w['id']}")] for w in L.workers()]
@@ -104,11 +120,15 @@ async def advance(app, rid):
         await send(app.bot, OWNER, f"❓ {name}: на какой день этот отчёт?", K(rows))
     elif kind == "price":
         name = L.worker(r["worker_id"])["name"]
-        await send(app.bot, OWNER, f"❓ {name}: сколько стоит чек {arg:,}? Ответьте числом.")
-        app.bot_data.setdefault("pq", {})[r["msg_id"]] = (rid, arg)
+        m = await send(app.bot, OWNER, f"❓ {name}: сколько стоит чек {arg:,}? Ответьте числом.")
+        if m:
+            app.bot_data.setdefault("pq", {})[m.message_id] = (rid, arg)
+
 
 async def ask_adj(app, aid):
     a = L.adj(aid)
+    if a is None:
+        return
     snippet = (a["raw"] or "")[:300]
     if a["worker_id"] is None:
         rows = [[B(w["name"], f"aw:{aid}:{w['id']}")] for w in L.workers()]
@@ -116,9 +136,11 @@ async def ask_adj(app, aid):
         kind_name = "штраф" if a["kind"] == "fine" else "бонус"
         await send(app.bot, OWNER, f"❓ Кому {kind_name} {L.money(a['usd'])}$?\n\n{snippet}", K(rows))
     elif a["kind"] is None:
-        rows = [[B("Штраф", f"ak:{aid}:fine"), B("Бонус", f"ak:{aid}:bonus")], [B("🚫 Игнорировать", f"ai:{aid}")]]
+        rows = [[B("Штраф", f"ak:{aid}:fine"), B("Бонус", f"ak:{aid}:bonus")],
+                [B("🚫 Игнорировать", f"ai:{aid}")]]
         w = L.worker(a["worker_id"])["name"]
         await send(app.bot, OWNER, f"❓ {w}: {L.money(a['usd'])}$ это штраф или бонус?\n\n{snippet}", K(rows))
+
 
 async def confirm_adjs(app, ids):
     lines, rows = [], []
@@ -132,6 +154,7 @@ async def confirm_adjs(app, ids):
     for sid in staff_ids():
         await send(app.bot, sid, "✅ Записано:\n" + "\n".join(lines), K(rows))
 
+
 async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -140,10 +163,14 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = msg.text or msg.caption
     if not text:
         return
+
     row = L.chat(chat.id)
-    if not row or not row["watch"]:
+    if row is None:
+        L.upsert_chat(chat.id, chat.title or str(chat.id))
+        L.set_watch(chat.id, 1)
+    elif not row["watch"]:
         return
-    
+
     try:
         await msg.set_reaction(reaction="👀")
     except Exception:
@@ -164,7 +191,8 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         done = []
         for it in items:
             pending = 0 if (it["worker_id"] and it["kind"]) else 1
-            aid = L.add_adj(it["worker_id"], it["kind"], it["usd"], L.iso(day), text, chat.id, msg.message_id, pending)
+            aid = L.add_adj(it["worker_id"], it["kind"], it["usd"], L.iso(day), text,
+                            chat.id, msg.message_id, pending)
             if pending:
                 await ask_adj(app, aid)
             else:
@@ -178,7 +206,8 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     wid = None
     if uid == OWNER:
-        wid = L.self_worker()["id"]
+        sw = L.self_worker()
+        wid = sw["id"] if sw else None
     elif uid:
         u = L.user(uid)
         wid = u["worker_id"] if u else None
@@ -190,6 +219,7 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rid = L.create_report(wid, chat.id, msg.message_id, uid, text, checks)
     await advance(app, rid)
 
+
 async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cm = update.my_chat_member
     chat = cm.chat
@@ -200,14 +230,16 @@ async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         L.upsert_chat(chat.id, chat.title or str(chat.id))
         L.set_watch(chat.id, 1)
 
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if update.effective_chat.type != "private":
         return
+    ctx.user_data.pop("st", None)
     if is_staff(u.id):
         await update.message.reply_text("Главное меню:", reply_markup=main_kb())
         return
-    
+
     row = L.user(u.id)
     if row and row["worker_id"]:
         await update.message.reply_text("Ваша панель:", reply_markup=worker_menu_kb())
@@ -215,11 +247,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     rows = [[B(w["name"], f"ul:{u.id}:{w['id']}")] for w in L.workers()]
     rows.append([B("👑 Назначить админом", f"ua:{u.id}"), B("❌ Отказать", f"ux:{u.id}")])
-    await send(ctx.bot, OWNER, f"👤 Запрос доступа: {u.full_name} (@{u.username})", K(rows))
+    uname = f"@{u.username}" if u.username else "без username"
+    await send(ctx.bot, OWNER, f"👤 Запрос доступа: {u.full_name} ({uname})", K(rows))
     await update.message.reply_text("Запрос отправлен.")
+
 
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш ID: {update.effective_user.id}")
+
 
 def card(w):
     t = L.today()
@@ -229,19 +264,23 @@ def card(w):
     status = "активен" if w["active"] else "в архиве"
     return f"{w['name']} ({status})\nПроцент: {L.money(p)}%\nTelegram: {tg}"
 
+
 def card_kb(w):
     wid = w["id"]
     return K([
         [B("📊 Сегодня", f"rep:td:{wid}"), B("📅 Вчера", f"rep:yd:{wid}")],
-        [B("📈 Этот месяц", f"rep:tw:{wid}"), B("📉 Прошлый", f"rep:lw:{wid}")],
-        [B("💵 Изменить %", f"wp:{wid}"), B("⚠️ Штраф/Бонус", f"wf:{wid}")],
+        [B("📈 Этот месяц", f"rep:tm:{wid}"), B("📉 Прошлый месяц", f"rep:lm:{wid}")],
+        [B("🗓 Эта неделя", f"rep:tw:{wid}"), B("🗓 Прошлая неделя", f"rep:lw:{wid}")],
+        [B("💵 Изменить %", f"wp:{wid}"), B("⚠️ Штраф", f"wf:{wid}")],
         [B("💸 Выдать аванс", f"adv:{wid}"), B("🔄 Замена", f"wrep:{wid}")],
         [B("🔙 Abrabotchiklar", "w:list")]
     ])
 
+
 async def show_card(q, wid):
     w = L.worker(wid)
     await edit(q, card(w), card_kb(w))
+
 
 async def show_prices(q):
     rows = []
@@ -252,19 +291,20 @@ async def show_prices(q):
     rows.append(menu_btn())
     await edit(q, "Прайс (нажмите для удаления):", K(rows))
 
+
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     d = q.data
     p = d.split(":")
-    
-    await q.answer()
-    
+    app = ctx.application
+
     if p[0] == "me":
         u = L.user(uid)
         if not u or not u["worker_id"]:
             await q.answer("У вас нет привязанного abrabotchika.", show_alert=True)
             return
+        await q.answer()
         wid = u["worker_id"]
         if p[1] == "menu":
             await edit(q, "Выберите период для отчёта:", K([
@@ -286,10 +326,12 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await edit(q, "Ваша панель:", worker_menu_kb())
         return
 
+    await q.answer()
     if not is_staff(uid):
         return
 
     if d == "m:main":
+        ctx.user_data.pop("st", None)
         await edit(q, "Главное меню:", main_kb())
     elif d == "rs:menu":
         await edit(q, "За какой период общий отчёт?", K(period_rows("rs")))
@@ -302,7 +344,8 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s, e = L.period_range(p[1])
         await send(ctx.bot, uid, L.rating_text(L.calc(s, e), L.label(s, e)), K([menu_btn()]))
     elif d == "w:list":
-        rows = [[B(f"{w['name']} ({L.money(L.percent_on(w['id'], L.today()))}%)", f"w:{w['id']}")] for w in L.workers()]
+        rows = [[B(f"{w['name']} ({L.money(L.percent_on(w['id'], L.today()))}%)", f"w:{w['id']}")]
+                for w in L.workers()]
         rows.append([B("+ Новый abrabotchik", "w:new")])
         rows.append(menu_btn())
         await edit(q, "Abrabotchiklar:", K(rows))
@@ -340,7 +383,8 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["st"] = ("priceadd",)
         await edit(q, "Напишите: «сумма цена» (например 5200 20) или «от до цена»", K([menu_btn()]))
     elif d == "ch:menu":
-        rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])), f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
+        rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])),
+                   f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
         rows.append(menu_btn())
         await edit(q, "Чаты и каналы (нажмите для включения/выключения):", K(rows))
     elif p[0] == "cw":
@@ -348,11 +392,15 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await edit(q, "Статус слежения обновлён.", K([menu_btn()]))
     elif d == "q:list":
         pr = L.pending_reports()
-        if not pr:
+        pa = L.pending_adjs()
+        if not pr and not pa:
             await edit(q, "Открытых вопросов нет 😊", K([menu_btn()]))
         else:
+            await edit(q, "Открытые вопросы отправлены ниже 👇", K([menu_btn()]))
             for rid in pr:
                 await advance(app, rid)
+            for aid in pa:
+                await ask_adj(app, aid)
     elif p[0] == "pw":
         rid, wid = int(p[1]), int(p[2])
         L.x("update reports set worker_id=? where id=?", (wid, rid))
@@ -366,11 +414,36 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif p[0] == "pwi":
         L.delete_report(int(p[1]))
         await edit(q, "❌ Отчёт проигнорирован.")
+    elif p[0] in ("aw", "ak"):
+        aid = int(p[1])
+        a = L.adj(aid)
+        if a is None:
+            return
+        if p[0] == "aw":
+            L.adj_resolve(aid, worker_id=int(p[2]))
+        else:
+            L.adj_resolve(aid, kind=p[2])
+        a = L.adj(aid)
+        if a["worker_id"] is not None and a["kind"] is not None:
+            await edit(q, "✅ Принято.")
+            await confirm_adjs(app, [aid])
+        else:
+            await edit(q, "Принято, нужно уточнить ещё.")
+            await ask_adj(app, aid)
+    elif p[0] == "ai":
+        L.adj_delete(int(p[1]))
+        await edit(q, "🚫 Проигнорировано.")
+    elif p[0] == "ac":
+        aid = int(p[1])
+        L.adj_toggle(aid)
+        a = L.adj(aid)
+        if a:
+            await edit(q, "↩️ Отменено." if a["cancelled"] else "✅ Восстановлено.", K([menu_btn()]))
     elif p[0] == "ul":
         tid, wid = int(p[1]), int(p[2])
         L.upsert_user(tid, "", "worker", wid)
         await edit(q, f"✅ Пользователь подключен как {L.worker(wid)['name']}")
-        await send(ctx.bot, tid, "Доступ открыт!", worker_menu_kb())
+        await send(ctx.bot, tid, "Доступ открыт! Нажмите /start", worker_menu_kb())
     elif p[0] == "ua":
         tid = int(p[1])
         L.upsert_user(tid, "", "admin", None)
@@ -379,36 +452,39 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif p[0] == "ux":
         await edit(q, "❌ Доступ отклонен.")
 
+
 async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     msg = update.message
-    if not is_staff(u.id):
+    if not msg or not is_staff(u.id):
         return
     text = (msg.text or "").strip()
     app = ctx.application
-
-    pq = app.bot_data.get("pq", {})
-    if msg.reply_to_message and msg.reply_to_message.message_id in pq:
-        key = msg.reply_to_message.message_id
-    elif len(pq) == 1:
-        key = next(iter(pq))
-    else:
-        key = None
-
-    if key is not None:
-        try:
-            v = float(text.replace(",", "."))
-        except ValueError:
-            await msg.reply_text("Нужно число.")
-            return
-        rid, amount = pq.pop(key)
-        L.add_price(amount, amount, v)
-        await msg.reply_text(f"✅ Запомнил: {amount:,} = {L.money(v)}$")
-        for r in L.pending_reports():
-            await advance(app, r)
-        return
-
     st = ctx.user_data.get("st")
+
+    pq = app.bot_data.setdefault("pq", {})
+    if pq and not st:
+        key = None
+        if msg.reply_to_message and msg.reply_to_message.message_id in pq:
+            key = msg.reply_to_message.message_id
+        elif len(pq) == 1:
+            key = next(iter(pq))
+        if key is not None:
+            try:
+                v = float(text.replace(",", "."))
+            except ValueError:
+                v = None
+            if v is not None:
+                rid, amount = pq[key]
+                pq.clear()
+                L.add_price(amount, amount, v)
+                await msg.reply_text(f"✅ Запомнил: {amount:,} = {L.money(v)}$")
+                for r in L.pending_reports():
+                    need = L.report_needs(r)
+                    if need is None or need[0] == "price":
+                        await advance(app, r)
+                return
+
     if not st:
         await msg.reply_text("Главное меню:", reply_markup=main_kb())
         return
@@ -422,62 +498,84 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Какой процент у {text}? Напишите число (например 30):")
     elif act == "newpct":
         try:
-            v = float(text)
+            v = float(text.replace(",", "."))
         except ValueError:
             await msg.reply_text("Введите число от 0 до 100:")
             return
-        wid = L.add_worker(st[1], v)
-        ctx.user_data.pop("st")
+        try:
+            wid = L.add_worker(st[1], v)
+        except Exception:
+            ctx.user_data.pop("st", None)
+            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb())
+            return
+        ctx.user_data.pop("st", None)
         w = L.worker(wid)
         await msg.reply_text(f"✅ Добавлен abrabotchik: {st[1]} {L.money(v)}%", reply_markup=card_kb(w))
     elif act == "pct":
         try:
-            v = float(text)
+            v = float(text.replace(",", "."))
         except ValueError:
             await msg.reply_text("Введите число:")
             return
-        ctx.user_data.pop("st")
+        ctx.user_data.pop("st", None)
         wid = st[1]
         L.set_percent(wid, v, L.iso(L.today()))
         w = L.worker(wid)
         await msg.reply_text(f"✅ Процент обновлен на {L.money(v)}%", reply_markup=card_kb(w))
     elif act == "adv":
         try:
-            v = float(text)
+            v = float(text.replace(",", "."))
         except ValueError:
             await msg.reply_text("Введите сумму числом:")
             return
-        ctx.user_data.pop("st")
+        ctx.user_data.pop("st", None)
         wid = st[1]
         L.add_advance(wid, v, L.iso(L.today()), "Аванс")
         w = L.worker(wid)
         await msg.reply_text(f"✅ Выдан аванс: {L.money(v)}$", reply_markup=card_kb(w))
     elif act == "fine":
         try:
-            v = float(text)
+            v = float(text.replace(",", "."))
         except ValueError:
             await msg.reply_text("Введите число:")
             return
-        ctx.user_data.pop("st")
+        ctx.user_data.pop("st", None)
         wid = st[1]
-        aid = L.add_adj(wid, "fine", v, L.iso(L.today()), "вручную")
-        await msg.reply_text(f"✅ Штраф добавлен: {L.money(v)}$")
+        L.add_adj(wid, "fine", v, L.iso(L.today()), "вручную")
+        w = L.worker(wid)
+        await msg.reply_text(f"✅ Штраф добавлен: {L.money(v)}$", reply_markup=card_kb(w))
     elif act == "replace":
+        if not text:
+            await msg.reply_text("Имя не может быть пустым.")
+            return
         old = L.worker(st[1])
-        ctx.user_data.pop("st")
         pct = L.percent_on(old["id"], L.today())
-        wid = L.add_worker(text, pct)
+        try:
+            wid = L.add_worker(text, pct)
+        except Exception:
+            ctx.user_data.pop("st", None)
+            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb())
+            return
+        ctx.user_data.pop("st", None)
         L.set_active(old["id"], 0)
         w = L.worker(wid)
         await msg.reply_text(f"✅ {text} заменяет {old['name']}", reply_markup=card_kb(w))
     elif act == "priceadd":
-        nums = [float(t.replace(",", ".")) for t in text.split()]
-        ctx.user_data.pop("st")
+        try:
+            nums = [float(t.replace(",", ".")) for t in text.split()]
+        except ValueError:
+            await msg.reply_text("Нужны только числа. Пример: 5200 20")
+            return
         if len(nums) == 2:
             L.add_price(int(nums[0]), int(nums[0]), nums[1])
         elif len(nums) == 3:
             L.add_price(int(nums[0]), int(nums[1]), nums[2])
+        else:
+            await msg.reply_text("Нужно 2 или 3 числа. Пример: 5200 20")
+            return
+        ctx.user_data.pop("st", None)
         await msg.reply_text("✅ Добавлено в прайс.", reply_markup=main_kb())
+
 
 async def post_init(app: Application):
     for rid in L.pending_reports():
@@ -485,17 +583,20 @@ async def post_init(app: Application):
     for aid in L.pending_adjs():
         await ask_adj(app, aid)
 
+
 def main():
     L.db()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP) & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_chat_text))
-    
-    hh, mm = (int(v) for v in REPORT_TIME.split(":"))
+    app.add_handler(MessageHandler(
+        (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+        on_chat_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
