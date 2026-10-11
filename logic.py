@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS advances (
     day TEXT NOT NULL,
     note TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_checks_report ON checks(report_id);
+CREATE INDEX IF NOT EXISTS idx_checks_rd ON checks(rd);
+CREATE INDEX IF NOT EXISTS idx_reports_worker ON reports(worker_id, status);
+CREATE INDEX IF NOT EXISTS idx_adj_worker ON adj(worker_id, day);
 """
 
 SEED_PRICES = [
@@ -108,6 +112,11 @@ def db():
     if _db is None:
         _db = sqlite3.connect(DB_PATH, check_same_thread=False)
         _db.row_factory = sqlite3.Row
+        try:
+            _db.execute("PRAGMA journal_mode=WAL")
+            _db.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         _db.executescript(SCHEMA)
         if not _db.execute("select 1 from workers").fetchone():
             for name, p, s in SEED_WORKERS:
