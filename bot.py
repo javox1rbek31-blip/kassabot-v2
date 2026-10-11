@@ -61,7 +61,7 @@ async def edit(q, text, kb=None):
 def main_kb():
     return K([
         [B("📊 Отчёты", "rs:menu"), B("🏆 Рейтинг", "rt:menu")],
-        [B("👥 Abrabotchiklar", "w:list"), B("💲 Прайс", "pr:menu")],
+        [B("👥 Обработчики", "w:list"), B("💲 Прайс", "pr:menu")],
         [B("💬 Чаты", "ch:menu"), B("❓ Вопросы", "q:list")]
     ])
 
@@ -273,7 +273,7 @@ def card_kb(w):
         [B("🗓 Эта неделя", f"rep:tw:{wid}"), B("🗓 Прошлая неделя", f"rep:lw:{wid}")],
         [B("💵 Изменить %", f"wp:{wid}"), B("⚠️ Штраф", f"wf:{wid}")],
         [B("💸 Выдать аванс", f"adv:{wid}"), B("🔄 Замена", f"wrep:{wid}")],
-        [B("🔙 Abrabotchiklar", "w:list")]
+        [B("🔙 Обработчики", "w:list")]
     ])
 
 
@@ -302,7 +302,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if p[0] == "me":
         u = L.user(uid)
         if not u or not u["worker_id"]:
-            await q.answer("У вас нет привязанного abrabotchika.", show_alert=True)
+            await q.answer("У вас нет привязанного обработчика.", show_alert=True)
             return
         await q.answer()
         wid = u["worker_id"]
@@ -346,12 +346,12 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "w:list":
         rows = [[B(f"{w['name']} ({L.money(L.percent_on(w['id'], L.today()))}%)", f"w:{w['id']}")]
                 for w in L.workers()]
-        rows.append([B("+ Новый abrabotchik", "w:new")])
+        rows.append([B("+ Новый обработчик", "w:new")])
         rows.append(menu_btn())
-        await edit(q, "Abrabotchiklar:", K(rows))
+        await edit(q, "Обработчики:", K(rows))
     elif d == "w:new":
         ctx.user_data["st"] = ("newname",)
-        await edit(q, "Напишите имя нового abrabotchika:", K([menu_btn()]))
+        await edit(q, "Напишите имя нового обработчика:", K([menu_btn()]))
     elif p[0] == "w" and p[1].isdigit():
         await show_card(q, int(p[1]))
     elif p[0] == "wp":
@@ -373,7 +373,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif p[0] == "wrep":
         ctx.user_data["st"] = ("replace", int(p[1]))
         w = L.worker(int(p[1]))
-        await edit(q, f"Кто заменяет {w['name']}? Напишите имя нового abrabotchika:", K([menu_btn()]))
+        await edit(q, f"Кто заменяет {w['name']}? Напишите имя нового обработчика:", K([menu_btn()]))
     elif d == "pr:menu":
         await show_prices(q)
     elif p[0] == "prd":
@@ -404,7 +404,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif p[0] == "pw":
         rid, wid = int(p[1]), int(p[2])
         L.x("update reports set worker_id=? where id=?", (wid, rid))
-        await edit(q, f"✅ Abrabotchik назначен: {L.worker(wid)['name']}")
+        await edit(q, f"✅ Обработчик назначен: {L.worker(wid)['name']}")
         await advance(app, rid)
     elif p[0] == "pd":
         rid = int(p[1])
@@ -486,6 +486,35 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
 
     if not st:
+        # Отчёт, отправленный боту в личку
+        day = msg.date.astimezone(L.TZ).date()
+        if L.has_kind(text):
+            items = L.parse_adjustments(text)
+            if items:
+                done = []
+                for it in items:
+                    pending = 0 if (it["worker_id"] and it["kind"]) else 1
+                    aid = L.add_adj(it["worker_id"], it["kind"], it["usd"], L.iso(day), text,
+                                    u.id, msg.message_id, pending)
+                    if pending:
+                        await ask_adj(app, aid)
+                    else:
+                        done.append(aid)
+                if done:
+                    await confirm_adjs(app, done)
+                return
+        checks = L.parse_report(text, day)
+        if checks:
+            wid = None
+            if u.id == OWNER:
+                sw = L.self_worker()
+                wid = sw["id"] if sw else None
+            if wid is None:
+                wid = L.worker_by_name(text)
+            await msg.reply_text("✅ Отчёт принят, считаю...")
+            rid = L.create_report(wid, u.id, msg.message_id, u.id, text, checks)
+            await advance(app, rid)
+            return
         await msg.reply_text("Главное меню:", reply_markup=main_kb())
         return
 
@@ -510,7 +539,7 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ctx.user_data.pop("st", None)
         w = L.worker(wid)
-        await msg.reply_text(f"✅ Добавлен abrabotchik: {st[1]} {L.money(v)}%", reply_markup=card_kb(w))
+        await msg.reply_text(f"✅ Добавлен обработчик: {st[1]} {L.money(v)}%", reply_markup=card_kb(w))
     elif act == "pct":
         try:
             v = float(text.replace(",", "."))
@@ -586,7 +615,11 @@ async def post_init(app: Application):
 
 def main():
     L.db()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = (Application.builder()
+           .token(TOKEN)
+           .post_init(post_init)
+           .concurrent_updates(True)
+           .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_cb))
