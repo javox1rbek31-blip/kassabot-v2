@@ -8,13 +8,15 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tashkent"))
 DB_PATH = os.getenv("DB_PATH", "kassa.db")
-ANON = 1087968824
+
 
 def today():
     return dt.datetime.now(TZ).date()
 
+
 def iso(d):
     return d.isoformat()
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workers (
@@ -100,6 +102,7 @@ SEED_WORKERS = [
 
 _db = None
 
+
 def db():
     global _db
     if _db is None:
@@ -115,45 +118,57 @@ def db():
         _db.commit()
     return _db
 
+
 def q(sql, args=()):
     return db().execute(sql, args).fetchall()
 
+
 def ql(sql, args=()):
     return db().execute(sql, args).fetchone()
+
 
 def x(sql, args=()):
     cur = db().execute(sql, args)
     db().commit()
     return cur
 
+
 def workers(active_only=True):
     sql = "select * from workers" + (" where active=1" if active_only else "")
     return q(sql + " order by is_self desc, id")
 
+
 def worker(wid):
     return ql("select * from workers where id=?", (wid,))
 
+
 def self_worker():
     return ql("select * from workers where is_self=1")
+
 
 def percent_on(wid, day):
     d = day if isinstance(day, str) else iso(day)
     r = ql("select percent from pct where worker_id=? and from_day<=? order by from_day desc limit 1", (wid, d))
     return r["percent"] if r else 0.0
 
+
 def add_worker(name, percent, from_day="2000-01-01"):
     cur = x("insert into workers (name) values (?)", (name.strip(),))
     x("insert into pct values (?,?,?)", (cur.lastrowid, from_day, percent))
     return cur.lastrowid
 
+
 def set_percent(wid, percent, from_day):
     x("insert or replace into pct values (?,?,?)", (wid, from_day, percent))
+
 
 def rename_worker(wid, name):
     x("update workers set name=? where id=?", (name.strip(), wid))
 
+
 def set_active(wid, v):
     x("update workers set active=? where id=?", (v, wid))
+
 
 def worker_by_name(text):
     names = sorted(workers(), key=lambda w: len(w["name"]), reverse=True)
@@ -162,45 +177,59 @@ def worker_by_name(text):
             return w["id"]
     return None
 
+
 def user(tg_id):
     return ql("select * from users where tg_id=?", (tg_id,))
+
 
 def upsert_user(tg_id, name, role, worker_id):
     x("insert into users (tg_id, name, role, worker_id) values (?,?,?,?) "
       "on conflict(tg_id) do update set name=excluded.name, role=excluded.role, worker_id=excluded.worker_id",
       (tg_id, name, role, worker_id))
 
+
 def admins():
     return [r["tg_id"] for r in q("select tg_id from users where role='admin'")]
+
 
 def users_of_worker(wid):
     return q("select * from users where worker_id=?", (wid,))
 
+
 def set_role(tg_id, role):
     x("update users set role=? where tg_id=?", (role, tg_id))
+
 
 def chat(cid):
     return ql("select * from chats where chat_id=?", (cid,))
 
+
 def upsert_chat(cid, title):
-    x("insert into chats (chat_id, title) values (?,?) on conflict(chat_id) do update set title=excluded.title", (cid, title))
+    x("insert into chats (chat_id, title) values (?,?) on conflict(chat_id) do update set title=excluded.title",
+      (cid, title))
+
 
 def set_watch(cid, v):
     x("update chats set watch=? where chat_id=?", (v, cid))
+
 
 def price_for(amount):
     r = ql("select usd from prices where lo<=? and hi>=? order by (hi-lo) asc limit 1", (amount, amount))
     return r["usd"] if r else None
 
+
 def add_price(lo, hi, usd):
     x("insert into prices (lo, hi, usd) values (?,?,?)", (min(lo, hi), max(lo, hi), usd))
     refresh_prices()
 
+
 def del_price(pid):
     x("delete from prices where id=?", (pid,))
 
+
 def list_prices():
     return q("select * from prices order by lo")
+
 
 def refresh_prices():
     for c in q("select id, amount from checks where usd is null"):
@@ -208,11 +237,13 @@ def refresh_prices():
         if p is not None:
             x("update checks set usd=? where id=?", (p, c["id"]))
 
-RD_FIND = re.compile(r"(?<![A-Za-zA-Яа-я])(?:rd|рд)\W{0,3}(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", re.I)
+
+RD_FIND = re.compile(r"(?<![A-Za-zА-Яа-я])(?:rd|рд)\W{0,3}(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", re.I)
 DATE_RE = re.compile(r"(?<!\d)\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?!\d)")
 TIME_RE = re.compile(r"\d{1,2}:\d{2}")
 NUM_RE = re.compile(r"(?<!\d)(\d{1,2}(?:,\d{3})+|\d{3,6})(?!\d)")
 TOTAL_RE = re.compile(r"итого|всего|jami|umumiy|total|касса|kassa|сумма|зп\b|зарплата", re.I)
+
 
 def mk_date(d, m, y=None, ref=None):
     ref = ref or today()
@@ -228,12 +259,15 @@ def mk_date(d, m, y=None, ref=None):
     except ValueError:
         return None
 
+
 def find_rd(line, ref=None):
     m = RD_FIND.search(line)
     return mk_date(m.group(1), m.group(2), m.group(3), ref) if m else None
 
+
 def has_rd(text):
     return bool(RD_FIND.search(text))
+
 
 def parse_report(text, ref=None):
     lines = text.splitlines()
@@ -256,42 +290,43 @@ def parse_report(text, ref=None):
                 out.append((used_rd, v))
     return out
 
+
 KIND_PAT = r"штраф\w*|shtraf\w*|jarima\w*|бонус\w*|bonus\w*|премия\w*|прем\w*"
 KIND_RE = re.compile(KIND_PAT, re.I)
+
 
 def has_kind(text):
     return bool(KIND_RE.search(text))
 
+
 def kind_of(tok):
     return "fine" if re.match(r"штраф|shtraf|jarima", tok, re.I) else "bonus"
+
 
 def parse_adjustments(text):
     ws = workers()
     names = sorted([w["name"] for w in ws], key=len, reverse=True)
     name_pat = "|".join(re.escape(n) for n in names) or "(?!x)x"
     by_name = {w["name"].lower(): w["id"] for w in ws}
-    tok = re.compile(rf"(?P<kind>{KIND_PAT})|(?P<name>(?<!\w)(?:{name_pat})(?!\w))|(?P<num>\d+(?:[.,]\d+)?)\s*\$?", re.I)
+    tok = re.compile(
+        rf"(?P<kind>{KIND_PAT})|(?P<name>(?<!\w)(?:{name_pat})(?!\w))|(?P<num>\d+(?:[.,]\d+)?)\s*\$?",
+        re.I)
     t2 = DATE_RE.sub("", text)
     kind, wid = None, None
-    items, kinds, wids = [], set(), set()
+    items = []
     for m in tok.finditer(t2):
         if m.group("kind"):
             kind = kind_of(m.group("kind"))
-            kinds.add(kind)
         elif m.group("name"):
             wid = by_name.get(m.group("name").lower())
-            wids.add(wid)
         elif m.group("num") and kind:
             items.append({"kind": kind, "worker_id": wid, "usd": float(m.group("num").replace(",", "."))})
-    for it in items:
-        if it["kind"] is None and len(kinds) == 1:
-            it["kind"] = next(iter(kinds))
-        if it["worker_id"] is None and len(wids) == 1:
-            it["worker_id"] = next(iter(wids))
     return items
+
 
 def report(rid):
     return ql("select * from reports where id=?", (rid,))
+
 
 def create_report(worker_id, chat_id, msg_id, sender_id, raw, checks):
     if msg_id is not None:
@@ -305,12 +340,16 @@ def create_report(worker_id, chat_id, msg_id, sender_id, raw, checks):
           (rid, iso(rd) if rd else None, amt, price_for(amt)))
     return rid
 
+
 def delete_report(rid):
     x("delete from checks where report_id=?", (rid,))
     x("delete from reports where id=?", (rid,))
 
+
 def report_needs(rid):
     r = report(rid)
+    if r is None:
+        return None
     if r["worker_id"] is None:
         return ("worker", None)
     if ql("select 1 from checks where report_id=? and rd is null", (rid,)):
@@ -320,43 +359,62 @@ def report_needs(rid):
         return ("price", row["amount"])
     return None
 
+
 def pending_reports():
     return [r["id"] for r in q("select id from reports where status='pending'")]
 
+
 def report_days(rid):
     return [r["rd"] for r in q("select distinct rd from checks where report_id=?", (rid,)) if r["rd"]]
+
 
 def add_adj(worker_id, kind, usd, day, raw, chat_id=None, msg_id=None, pending=0):
     return x("insert into adj (worker_id, kind, usd, day, raw, chat_id, msg_id, pending) values (?,?,?,?,?,?,?,?)",
              (worker_id, kind, usd, day, raw, chat_id, msg_id, pending)).lastrowid
 
+
 def adj(aid):
     return ql("select * from adj where id=?", (aid,))
+
 
 def adj_resolve(aid, worker_id=None, kind=None):
     a = adj(aid)
     wid = worker_id if worker_id is not None else a["worker_id"]
     kd = kind if kind is not None else a["kind"]
-    x("update adj set worker_id=?, kind=?, pending=0 where id=?", (wid, kd, aid))
+    pend = 0 if (wid is not None and kd is not None) else 1
+    x("update adj set worker_id=?, kind=?, pending=? where id=?", (wid, kd, pend, aid))
+
 
 def adj_toggle(aid):
     x("update adj set cancelled=1-cancelled where id=?", (aid,))
 
+
+def adj_delete(aid):
+    x("delete from adj where id=?", (aid,))
+
+
 def drop_adj_msg(chat_id, msg_id):
     x("delete from adj where chat_id=? and msg_id=?", (chat_id, msg_id))
+
 
 def pending_adjs():
     return [r["id"] for r in q("select id from adj where pending=1")]
 
+
 def worker_adjs(wid, limit=15):
     return q("select * from adj where worker_id=? and pending=0 order by id desc limit ?", (wid, limit))
 
+
 def add_advance(worker_id, usd, day, note=""):
-    return x("insert into advances (worker_id, usd, day, note) values (?,?,?,?)", (worker_id, usd, day, note)).lastrowid
+    return x("insert into advances (worker_id, usd, day, note) values (?,?,?,?)",
+             (worker_id, usd, day, note)).lastrowid
+
 
 def worker_advances(wid, start, end):
     s, e = iso(start), iso(end)
-    return q("select sum(usd) as total from advances where worker_id=? and day between ? and ?", (wid, s, e))[0]["total"] or 0.0
+    r = q("select sum(usd) as total from advances where worker_id=? and day between ? and ?", (wid, s, e))[0]
+    return r["total"] or 0.0
+
 
 def period_range(key):
     t = today()
@@ -371,7 +429,13 @@ def period_range(key):
     if key == "lw":
         mon = t - dt.timedelta(days=t.weekday() + 7)
         return mon, mon + dt.timedelta(days=6)
+    if key == "tm":
+        return t.replace(day=1), t
+    if key == "lm":
+        last = t.replace(day=1) - dt.timedelta(days=1)
+        return last.replace(day=1), last
     return t, t
+
 
 def calc(start, end, only=None):
     s, e = iso(start), iso(end)
@@ -380,8 +444,10 @@ def calc(start, end, only=None):
         if only and w["id"] != only:
             continue
         rows = q("select ch.rd, ch.amount, ch.usd from checks ch join reports ro on ro.id=ch.report_id "
-                 "where ro.worker_id=? and ro.status='done' and ch.rd between ? and ?", (w["id"], s, e))
-        adjs = q("select * from adj where worker_id=? and cancelled=0 and pending=0 and day between ? and ?", (w["id"], s, e))
+                 "where ro.worker_id=? and ro.status='done' and ch.rd between ? and ? order by ch.rd, ch.id",
+                 (w["id"], s, e))
+        adjs = q("select * from adj where worker_id=? and cancelled=0 and pending=0 and day between ? and ?",
+                 (w["id"], s, e))
         adv = worker_advances(w["id"], start, end)
         if not only and not w["active"] and not rows and not adjs:
             continue
@@ -407,18 +473,23 @@ def calc(start, end, only=None):
         })
     return out
 
+
 def money(v):
     v = round(v + 1e-9, 2)
     return str(int(v)) if abs(v - int(v)) < 1e-9 else f"{v:.2f}"
 
+
 def n3(v):
     return f"{int(v):,}"
+
 
 def dshort(d):
     return dt.date.fromisoformat(d).strftime("%d.%m")
 
+
 def label(s, e):
     return dshort(iso(s)) if s == e else f"{dshort(iso(s))} - {dshort(iso(e))}"
+
 
 def chk_word(n):
     if n % 10 == 1 and n % 100 != 11:
@@ -427,11 +498,13 @@ def chk_word(n):
         return "чека"
     return "чеков"
 
+
 def adj_list(items):
     v = money(sum(a for a, _ in items))
     if len(items) > 1:
         return f"{v}$ (" + "+".join(money(a) for a, _ in items) + ")"
     return f"{v}$"
+
 
 def salary_lines(r):
     lines = [
@@ -439,13 +512,15 @@ def salary_lines(r):
         f"Штраф: {adj_list(r['fines']) if r['fines'] else '0$'}",
         f"Бонус: {adj_list(r['bonuses']) if r['bonuses'] else '0$'}"
     ]
-    if r['adv'] > 0:
+    if r["adv"] > 0:
         lines.append(f"Аванс: {money(r['adv'])}$")
     lines.append(f"Итого: {money(r['zp'])}-{money(r['fine'])}+{money(r['bonus'])}-{money(r['adv'])}={money(r['total'])}$")
     return lines
 
+
 def worker_text(r, lab):
     return "\n".join([f"{r['w']['name']} ({lab})"] + salary_lines(r))
+
 
 def clean_report(r, lab):
     lines = [f"{r['w']['name']} ({lab})"]
@@ -459,50 +534,55 @@ def clean_report(r, lab):
     lines += salary_lines(r)
     return "\n".join(lines)
 
+
 def explain(r, lab):
-    L = [f"Разбор: {r['w']['name']} ({lab})", "Каждый чек переводится в $ по прайсу:"]
+    out = [f"Разбор: {r['w']['name']} ({lab})", "Каждый чек переводится в $ по прайсу:"]
     if r["n"] == 0:
-        L.append("Чеков за период нет.")
+        out.append("Чеков за период нет.")
     for d in r["days"]:
-        L.append(f"Дата {dshort(d['day'])}:")
+        out.append(f"Дата {dshort(d['day'])}:")
         cnt = OrderedDict()
         for a, u in d["items"]:
             cnt[(a, u)] = cnt.get((a, u), 0) + 1
         for (a, u), k in cnt.items():
-            L.append(f"  {a} x{k} = {money(u * k)}$")
-        L.append(f"  Сумма кассы: {n3(d['raw'])} → по прайсу {money(d['usd'])}$")
-        L.append(f"  Зп за день: {money(d['usd'])}$ * {money(d['pct'])}% = {money(d['usd'] * d['pct'] / 100)}$")
+            out.append(f"  {a} x{k} = {money(u * k)}$")
+        out.append(f"  Сумма кассы: {n3(d['raw'])} → по прайсу {money(d['usd'])}$")
+        out.append(f"  Зп за день: {money(d['usd'])}$ * {money(d['pct'])}% = {money(d['usd'] * d['pct'] / 100)}$")
     if r["n"]:
-        L += ["", f"Касса по прайсу: {money(d['usd'])}$", f"Зп всего: {money(r['zp'])}$"]
+        out += ["", f"Касса по прайсу: {money(r['usd'])}$", f"Зп всего: {money(r['zp'])}$"]
     if r["fines"]:
-        L.append("Штраф: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["fines"]))
+        out.append("Штраф: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["fines"]))
     if r["bonuses"]:
-        L.append("Бонус: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["bonuses"]))
+        out.append("Бонус: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["bonuses"]))
     if r["adv"] > 0:
-        L.append(f"Аванс: {money(r['adv'])}$")
-    L.append(f"Итого: {money(r['zp'])}-{money(r['fine'])}+{money(r['bonus'])}-{money(r['adv'])}={money(r['total'])}$")
-    return "\n".join(L)
+        out.append(f"Аванс: {money(r['adv'])}$")
+    out.append(f"Итого: {money(r['zp'])}-{money(r['fine'])}+{money(r['bonus'])}-{money(r['adv'])}={money(r['total'])}$")
+    return "\n".join(out)
+
 
 def overall_text(res, lab):
-    L = [f"📊 Общий отчёт ({lab})", ""]
+    out = [f"📊 Общий отчёт ({lab})", ""]
     tot_n, tot_usd, tot_raw = 0, 0.0, 0
     for r in res:
         n = r["n"]
         tot_n += n
         tot_usd += r["usd"]
         tot_raw += r["raw"]
-        L.append(f"{r['w']['name']}: {n} {chk_word(n)}, касса {n3(r['raw'])}, зп {money(r['total'])}$")
-    L += ["", f"Всего чеков: {tot_n}", f"Касса (сумма чеков): {n3(tot_raw)}", f"Касса ($): {money(tot_usd)}$", f"Чистая прибыль: {money(tot_usd / 2)}$"]
-    return "\n".join(L)
+        out.append(f"{r['w']['name']}: {n} {chk_word(n)}, касса {n3(r['raw'])}, зп {money(r['total'])}$")
+    out += ["", f"Всего чеков: {tot_n}", f"Касса (сумма чеков): {n3(tot_raw)}",
+            f"Касса ($): {money(tot_usd)}$", f"Чистая прибыль: {money(tot_usd / 2)}$"]
+    return "\n".join(out)
+
 
 def rating_text(res, lab):
     rows = sorted([r for r in res if r["w"]["active"] or r["n"]], key=lambda r: r["usd"], reverse=True)
     medal = ["🥇", "🥈", "🥉"]
-    L = [f"🏆 Рейтинг кассы ({lab})", ""]
+    out = [f"🏆 Рейтинг кассы ({lab})", ""]
     for i, r in enumerate(rows):
-        m = medal[i] if i < 3 else f"{i + 1}️⃣"
-        L.append(f"{m} {r['w']['name']} — {n3(r['raw'])} ({r['n']} {chk_word(r['n'])})")
-    return "\n".join(L)
+        m = medal[i] if i < 3 else f"{i + 1}."
+        out.append(f"{m} {r['w']['name']} — {n3(r['raw'])} ({r['n']} {chk_word(r['n'])})")
+    return "\n".join(out)
+
 
 def chunks(text, limit=3800):
     out, cur = [], ""
