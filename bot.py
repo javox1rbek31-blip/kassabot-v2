@@ -11,7 +11,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("kassabot")
 
 TOKEN = os.environ["BOT_TOKEN"]
-OWNER = 8785896869
+OWNER =8785896869
+
 REPORT_TIME = os.getenv("REPORT_TIME", "23:30")
 
 PERIODS = [("Сегодня", "td"), ("Вчера", "yd"), ("Эта неделя", "tw"), ("Прошлая неделя", "lw")]
