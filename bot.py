@@ -77,7 +77,7 @@ async def edit(q, text, kb=None):
 
 
 async def show(bot, q, text, kb=None):
-    """Xabarni tahrirlaydi (yangi xabar yaratmaydi). Juda uzun bo'lsa — bo'laklab yuboradi."""
+    """Xabarni tahrirlaydi (yangi xabar yaratmaydi). Juda uzun bo'lsa - bo'laklab yuboradi."""
     parts = L.chunks(text)
     if len(parts) == 1:
         await edit(q, parts[0], kb)
@@ -228,15 +228,16 @@ async def ask_link(app, uid, name, wid):
 
 
 async def submit_report(app, u, chat_id, msg_id, text, day, strict):
+    """Hisobotni qabul qiladi. strict=True (guruh/kanal): sanasi bo'lmagan xabar hisobot emas."""
     checks = L.parse_report(text, day)
     if not checks:
+        return False
+    if strict and not L.parse_dates(text, day):
         return False
     uid = u.id if u else None
     if u:
         app.bot_data.setdefault("names", {})[uid] = u.full_name
     wid, by_name = detect_worker(uid, text)
-    if wid is None and strict and not L.has_rd(text):
-        return False
     rid = L.create_report(wid, chat_id, msg_id, uid, text, checks)
     if by_name and uid and uid != ANON and not is_staff(uid) and not L.user(uid):
         await ask_link(app, uid, u.full_name, wid)
@@ -260,11 +261,6 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif not row["watch"]:
         return
 
-    try:
-        await msg.set_reaction(reaction="👀")
-    except Exception:
-        pass
-
     edited = bool(update.edited_message or update.edited_channel_post)
     u = msg.from_user
     uid = u.id if u else None
@@ -272,26 +268,31 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     day = msg.date.astimezone(L.TZ).date()
     app = ctx.application
 
+    # Штраф / бонус: reaksiyasiz, jimgina yoziladi
     if staff and L.has_kind(text):
-        if edited:
-            L.drop_adj_msg(chat.id, msg.message_id)
         items = L.parse_adjustments(text)
-        if not items:
+        if items:
+            if edited:
+                L.drop_adj_msg(chat.id, msg.message_id)
+            done = []
+            for it in items:
+                pending = 0 if (it["worker_id"] and it["kind"]) else 1
+                aid = L.add_adj(it["worker_id"], it["kind"], it["usd"], L.iso(day), text,
+                                chat.id, msg.message_id, pending)
+                if pending:
+                    await ask_adj(app, aid)
+                else:
+                    done.append(aid)
+            if done:
+                await confirm_adjs(app, done)
             return
-        done = []
-        for it in items:
-            pending = 0 if (it["worker_id"] and it["kind"]) else 1
-            aid = L.add_adj(it["worker_id"], it["kind"], it["usd"], L.iso(day), text,
-                            chat.id, msg.message_id, pending)
-            if pending:
-                await ask_adj(app, aid)
-            else:
-                done.append(aid)
-        if done:
-            await confirm_adjs(app, done)
-        return
 
-    await submit_report(app, u, chat.id, msg.message_id, text, day, True)
+    # Hisobot: faqat shunga 👀
+    if await submit_report(app, u, chat.id, msg.message_id, text, day, True):
+        try:
+            await msg.set_reaction(reaction="👀")
+        except Exception:
+            pass
 
 
 async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -668,14 +669,9 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await edit(q, "Напишите: «сумма цена» (например 5200 20) или «от до цена»", K([menu_btn()]))
 
     # --- чаты ---
-    elif d == "ch:menu":
-        rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])),
-                   f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
-        rows.append(menu_btn())
-        await edit(q, "Чаты, куда добавлен бот.\n✅ — бот читает отчёты из этого чата\n❌ — игнорирует его\n"
-                      "Нажмите на чат, чтобы включить/выключить:", K(rows))
-    elif p[0] == "cw":
-        L.set_watch(int(p[1]), int(p[2]))
+    elif d == "ch:menu" or p[0] == "cw":
+        if p[0] == "cw":
+            L.set_watch(int(p[1]), int(p[2]))
         rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])),
                    f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
         rows.append(menu_btn())
