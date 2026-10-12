@@ -12,6 +12,7 @@ log = logging.getLogger("kassabot")
 
 TOKEN = os.environ["BOT_TOKEN"]
 OWNER = int(os.getenv("OWNER_ID", "8785896869"))
+ANON = 1087968824  # "anonymous admin" akkaunti
 
 
 def B(text, data):
@@ -24,6 +25,23 @@ def is_staff(uid):
 
 def staff_ids():
     return [OWNER] + [a for a in L.admins() if a != OWNER]
+
+
+def notify_ids(wid):
+    """Cashliy hisoboti faqat egaga ko'rinadi."""
+    w = L.worker(wid)
+    if w and w["is_self"]:
+        return [OWNER]
+    return staff_ids()
+
+
+def can_see(uid, wid):
+    w = L.worker(wid)
+    return bool(w) and (uid == OWNER or not w["is_self"])
+
+
+def visible(res, owner):
+    return [r for r in res if L.has_data(r) and (owner or not r["w"]["is_self"])]
 
 
 def menu_btn():
@@ -58,43 +76,65 @@ async def edit(q, text, kb=None):
             log.warning("edit failed: %s", e)
 
 
-def main_kb():
-    return K([
+async def show(bot, q, text, kb=None):
+    """Xabarni tahrirlaydi (yangi xabar yaratmaydi). Juda uzun bo'lsa — bo'laklab yuboradi."""
+    parts = L.chunks(text)
+    if len(parts) == 1:
+        await edit(q, parts[0], kb)
+    else:
+        await edit(q, "⬇️ Отчёт ниже", None)
+        await send(bot, q.message.chat_id, text, kb)
+
+
+async def tg_name(bot, tid):
+    try:
+        c = await bot.get_chat(tid)
+        return c.full_name or (f"@{c.username}" if c.username else str(tid))
+    except Exception:
+        return str(tid)
+
+
+def main_kb(uid):
+    rows = [
         [B("📊 Отчёты", "rs:menu"), B("🏆 Рейтинг", "rt:menu")],
+        [B("📆 Отчёт за дату", "dt:all")],
         [B("👥 Обработчики", "w:list"), B("💲 Прайс", "pr:menu")],
-        [B("💬 Чаты", "ch:menu"), B("❓ Вопросы", "q:list")]
-    ])
+        [B("💬 Чаты", "ch:menu"), B("❓ Вопросы", "q:list")],
+    ]
+    if uid == OWNER:
+        rows.append([B("👑 Cashliy", "ow:cash"), B("🛡 Админы", "adm:menu")])
+    return K(rows)
 
 
 def worker_menu_kb():
     return K([
         [B("📥 Мой отчёт (период)", "me:menu")],
-        [B("💰 Мой баланс", "me:balance")]
+        [B("💰 Мой баланс за неделю", "me:balance")]
     ])
 
 
-async def send_overall(bot, chat_id, s, e, kb=None):
-    res = L.calc(s, e)
-    lab = L.label(s, e)
-    await send(bot, chat_id, L.overall_text(res, lab))
-    await send(bot, chat_id, L.rating_text(res, lab), kb)
+# ---------- отчёты ----------
+
+def brief_kb(wid, day):
+    return K([[B("💰 Посчитать ЗП", f"zp:{wid}:{day}")]])
 
 
 async def finalize(app, rid):
-    L.x("update reports set status='done' where id=?", (rid,))
     r = L.report(rid)
     if r is None:
         return
+    L.x("update reports set status='done' where id=?", (rid,))
+    replaced = set(L.replace_old(rid))
     wid = r["worker_id"]
+    ids = notify_ids(wid)
     for d in L.report_days(rid):
         day = dt.date.fromisoformat(d)
         res = L.calc(day, day, only=wid)
-        if not res:
+        if not res or not res[0]["days"]:
             continue
-        lab = L.label(day, day)
-        for sid in staff_ids():
-            await send(app.bot, sid, L.explain(res[0], lab))
-            await send(app.bot, sid, L.clean_report(res[0], lab))
+        text = L.brief(res[0], d in replaced)
+        for sid in ids:
+            await send(app.bot, sid, text, brief_kb(wid, d))
 
 
 async def advance(app, rid):
@@ -110,7 +150,7 @@ async def advance(app, rid):
     if kind == "worker":
         rows = [[B(w["name"], f"pw:{rid}:{w['id']}")] for w in L.workers()]
         rows.append([B("❌ Это не отчёт", f"pwi:{rid}")])
-        await send(app.bot, OWNER, f"❓ Чей это отчёт?\n\n{snippet}", K(rows))
+        await send(app.bot, OWNER, f"❓ Кто это отправил?\n\n{snippet}", K(rows))
     elif kind == "date":
         t = L.today()
         ds = [t - dt.timedelta(days=i) for i in range(4)]
@@ -143,16 +183,65 @@ async def ask_adj(app, aid):
 
 
 async def confirm_adjs(app, ids):
-    lines, rows = [], []
-    for aid in ids:
-        a = L.adj(aid)
-        w = L.worker(a["worker_id"])["name"]
-        t = "Штраф" if a["kind"] == "fine" else "Бонус"
-        lines.append(f"{w}: {t} {L.money(a['usd'])}$ ({L.dshort(a['day'])})")
-        rows.append([B(f"Отменить {w} {t.lower()}", f"ac:{aid}")])
-    rows.append(menu_btn())
     for sid in staff_ids():
+        lines, rows = [], []
+        for aid in ids:
+            a = L.adj(aid)
+            wk = L.worker(a["worker_id"])
+            if wk["is_self"] and sid != OWNER:
+                continue
+            t = "Штраф" if a["kind"] == "fine" else "Бонус"
+            lines.append(f"{wk['name']}: {t} {L.money(a['usd'])}$ ({L.dshort(a['day'])})")
+            rows.append([B(f"Отменить {wk['name']} {t.lower()}", f"ac:{aid}")])
+        if not lines:
+            continue
+        rows.append(menu_btn())
         await send(app.bot, sid, "✅ Записано:\n" + "\n".join(lines), K(rows))
+
+
+def detect_worker(uid, text):
+    """Qaytaradi: (worker_id, ism_matndan_topildimi)"""
+    named = L.worker_by_name(text)
+    if uid == OWNER:
+        if named:
+            return named, False
+        sw = L.self_worker()
+        return (sw["id"] if sw else None), False
+    if uid:
+        u = L.user(uid)
+        if u and u["worker_id"]:
+            return u["worker_id"], False
+    return named, bool(named)
+
+
+async def ask_link(app, uid, name, wid):
+    asked = app.bot_data.setdefault("asked", set())
+    if uid in asked:
+        return
+    asked.add(uid)
+    w = L.worker(wid)
+    await send(app.bot, OWNER,
+               f"🔗 Аккаунт {name} (id {uid}) ещё не привязан.\nЭто {w['name']}?",
+               K([[B(f"✅ Да, это {w['name']}", f"lk:{uid}:{wid}")],
+                  [B("Другой обработчик", f"lko:{uid}")],
+                  [B("🚫 Не привязывать", "lkx")]]))
+
+
+async def submit_report(app, u, chat_id, msg_id, text, day, strict):
+    checks = L.parse_report(text, day)
+    if not checks:
+        return False
+    uid = u.id if u else None
+    if u:
+        app.bot_data.setdefault("names", {})[uid] = u.full_name
+    wid, by_name = detect_worker(uid, text)
+    if wid is None and strict and not L.has_rd(text):
+        return False
+    rid = L.create_report(wid, chat_id, msg_id, uid, text, checks)
+    if by_name and uid and uid != ANON and not is_staff(uid) and not L.user(uid):
+        await ask_link(app, uid, u.full_name, wid)
+    await advance(app, rid)
+    return True
 
 
 async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -177,7 +266,8 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
     edited = bool(update.edited_message or update.edited_channel_post)
-    uid = msg.from_user.id if msg.from_user else None
+    u = msg.from_user
+    uid = u.id if u else None
     staff = is_staff(uid)
     day = msg.date.astimezone(L.TZ).date()
     app = ctx.application
@@ -201,23 +291,7 @@ async def on_chat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await confirm_adjs(app, done)
         return
 
-    checks = L.parse_report(text, day)
-    if not checks:
-        return
-    wid = None
-    if uid == OWNER:
-        sw = L.self_worker()
-        wid = sw["id"] if sw else None
-    elif uid:
-        u = L.user(uid)
-        wid = u["worker_id"] if u else None
-    if wid is None:
-        wid = L.worker_by_name(text)
-    if wid is None and not L.has_rd(text):
-        return
-
-    rid = L.create_report(wid, chat.id, msg.message_id, uid, text, checks)
-    await advance(app, rid)
+    await submit_report(app, u, chat.id, msg.message_id, text, day, True)
 
 
 async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -237,7 +311,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data.pop("st", None)
     if is_staff(u.id):
-        await update.message.reply_text("Главное меню:", reply_markup=main_kb())
+        await update.message.reply_text("Главное меню:", reply_markup=main_kb(u.id))
         return
 
     row = L.user(u.id)
@@ -245,36 +319,50 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ваша панель:", reply_markup=worker_menu_kb())
         return
 
-    rows = [[B(w["name"], f"ul:{u.id}:{w['id']}")] for w in L.workers()]
-    rows.append([B("👑 Назначить админом", f"ua:{u.id}"), B("❌ Отказать", f"ux:{u.id}")])
+    ctx.application.bot_data.setdefault("names", {})[u.id] = u.full_name
+    rows = [[B(w["name"], f"lk:{u.id}:{w['id']}")] for w in L.workers()]
+    rows.append([B("➕ Новое имя", f"un:{u.id}")])
+    rows.append([B("👑 Админ", f"ua:{u.id}"), B("❌ Отказать", f"ux:{u.id}")])
     uname = f"@{u.username}" if u.username else "без username"
-    await send(ctx.bot, OWNER, f"👤 Запрос доступа: {u.full_name} ({uname})", K(rows))
-    await update.message.reply_text("Запрос отправлен.")
+    await send(ctx.bot, OWNER, f"👤 Запрос доступа: {u.full_name} ({uname}), id {u.id}\nКто это?", K(rows))
+    await update.message.reply_text("Запрос отправлен. Ожидайте.")
 
 
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш ID: {update.effective_user.id}")
 
 
+# ---------- карточка обработчика ----------
+
 def card(w):
     t = L.today()
     p = L.percent_on(w["id"], t)
     users = L.users_of_worker(w["id"])
-    tg = "подключён" if users else "не подключён"
+    tg = f"подключено аккаунтов: {len(users)}" if users else "не подключён"
     status = "активен" if w["active"] else "в архиве"
     return f"{w['name']} ({status})\nПроцент: {L.money(p)}%\nTelegram: {tg}"
 
 
 def card_kb(w):
     wid = w["id"]
-    return K([
+    rows = [
         [B("📊 Сегодня", f"rep:td:{wid}"), B("📅 Вчера", f"rep:yd:{wid}")],
-        [B("📈 Этот месяц", f"rep:tm:{wid}"), B("📉 Прошлый месяц", f"rep:lm:{wid}")],
         [B("🗓 Эта неделя", f"rep:tw:{wid}"), B("🗓 Прошлая неделя", f"rep:lw:{wid}")],
-        [B("💵 Изменить %", f"wp:{wid}"), B("⚠️ Штраф", f"wf:{wid}")],
-        [B("💸 Выдать аванс", f"adv:{wid}"), B("🔄 Замена", f"wrep:{wid}")],
-        [B("🔙 Обработчики", "w:list")]
-    ])
+        [B("📈 Этот месяц", f"rep:tm:{wid}"), B("📉 Прошлый месяц", f"rep:lm:{wid}")],
+        [B("📆 За дату", f"dt:w:{wid}"), B("✏️ Исправить чеки", f"fx:{wid}")],
+    ]
+    if not w["is_self"]:
+        rows.append([B("🔁 Замена на день", f"sub:{wid}")])
+    rows += [
+        [B("💵 Изменить %", f"wp:{wid}"), B("💸 Выдать аванс", f"adv:{wid}")],
+        [B("⚠️ Штраф", f"wf:{wid}"), B("🎁 Бонус", f"wb:{wid}")],
+    ]
+    if not w["is_self"]:
+        rows.append([B("🔄 Заменить навсегда", f"wrep:{wid}")])
+        rows.append([B("🔙 Обработчики", "w:list")])
+    else:
+        rows.append(menu_btn())
+    return K(rows)
 
 
 async def show_card(q, wid):
@@ -282,15 +370,65 @@ async def show_card(q, wid):
     await edit(q, card(w), card_kb(w))
 
 
+def price_label(r):
+    rng = f"{r['lo']:,}" if r["lo"] == r["hi"] else f"{r['lo']:,}-{r['hi']:,}"
+    return f"{rng} = {L.money(r['usd'])}$"
+
+
 async def show_prices(q):
-    rows = []
-    for r in L.list_prices():
-        rng = f"{r['lo']:,}" if r["lo"] == r["hi"] else f"{r['lo']:,}-{r['hi']:,}"
-        rows.append([B(f"{rng} = {L.money(r['usd'])}$", f"prd:{r['id']}")])
+    rows = [[B(price_label(r), f"prm:{r['id']}")] for r in L.list_prices()]
     rows.append([B("+ Добавить цену", "pra")])
     rows.append(menu_btn())
-    await edit(q, "Прайс (нажмите для удаления):", K(rows))
+    await edit(q, "Прайс (нажмите на цену, чтобы изменить или удалить):", K(rows))
 
+
+async def show_fx(q, wid, day):
+    w = L.worker(wid)
+    cs = L.day_checks(wid, day)
+    if not cs:
+        await edit(q, "На этот день чеков нет.", K([[B("🔙 Карточка", f"w:{wid}")]]))
+        return
+    used = sum(1 for c in cs if not c["skip"])
+    kb, row = [], []
+    for c in cs:
+        row.append(B(("🚫 " if c["skip"] else "✅ ") + str(c["amount"]), f"fxc:{c['id']}:{wid}:{day}"))
+        if len(row) == 3:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([B("📊 Показать разбор", f"fxr:{wid}:{day}")])
+    kb.append([B("🔙 Карточка", f"w:{wid}")])
+    await edit(q, f"✏️ {w['name']} — {L.dshort(day)}\nЗасчитано: {used} из {len(cs)}\n"
+                  f"Нажмите на чек, чтобы исключить 🚫 или вернуть ✅:", K(kb))
+
+
+async def show_admins(q):
+    rows = []
+    for u in L.all_users():
+        base = u["name"] or str(u["tg_id"])
+        if u["worker_id"]:
+            wk = L.worker(u["worker_id"])
+            if wk and not wk["is_self"]:
+                base += f" [{wk['name']}]"
+        if u["role"] == "admin":
+            rows.append([B(f"👑 {base} — снять админа", f"adm:rm:{u['tg_id']}")])
+        else:
+            rows.append([B(f"➕ {base} — сделать админом", f"adm:add:{u['tg_id']}")])
+    rows.append([B("+ Добавить по ID", "adm:new")])
+    rows.append(menu_btn())
+    await edit(q, "Админы и пользователи:", K(rows))
+
+
+def link_account(app, tid, wid):
+    names = app.bot_data.setdefault("names", {})
+    if L.user(tid):
+        L.x("update users set worker_id=? where tg_id=?", (wid, tid))
+    else:
+        L.upsert_user(tid, names.get(tid, ""), "worker", wid)
+
+
+# ---------- кнопки ----------
 
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -298,6 +436,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = q.data
     p = d.split(":")
     app = ctx.application
+    bot = ctx.bot
 
     if p[0] == "me":
         u = L.user(uid)
@@ -306,22 +445,28 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await q.answer()
         wid = u["worker_id"]
+        back = K([[B("🔙 Назад", "me:menu")]])
         if p[1] == "menu":
             await edit(q, "Выберите период для отчёта:", K([
                 [B("Сегодня", "me:td"), B("Вчера", "me:yd")],
                 [B("Эта неделя", "me:tw"), B("Прошлая неделя", "me:lw")],
-                [B("🔙 Меню", "me:back")]
+                [B("🔙 Назад", "me:back")]
             ]))
         elif p[1] in ("td", "yd", "tw", "lw"):
             s, e = L.period_range(p[1])
             res = L.calc(s, e, only=wid)
-            if res:
-                await send(ctx.bot, uid, L.clean_report(res[0], L.label(s, e)))
+            if res and L.has_data(res[0]):
+                await show(bot, q, L.worker_report(res[0], L.label(s, e)), back)
+            else:
+                await edit(q, f"За этот период ({L.label(s, e)}) отчётов нет.", back)
         elif p[1] == "balance":
-            t = L.today()
-            res = L.calc(t, t, only=wid)
-            if res:
-                await send(ctx.bot, uid, f"Ваша текущая зп за сегодня: {L.money(res[0]['total'])}$")
+            s, e = L.week_start(), L.today()
+            res = L.calc(s, e, only=wid)
+            if res and L.has_data(res[0]):
+                await edit(q, f"Ваша зп за неделю ({L.label(s, e)}): {L.money(res[0]['total'])}$",
+                           K([[B("🔙 Назад", "me:back")]]))
+            else:
+                await edit(q, "За эту неделю отчётов пока нет.", K([[B("🔙 Назад", "me:back")]]))
         elif p[1] == "back":
             await edit(q, "Ваша панель:", worker_menu_kb())
         return
@@ -329,23 +474,80 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not is_staff(uid):
         return
+    owner = uid == OWNER
+    if p[0] in ("adm", "un", "ua", "ux", "lk", "lko", "lkx", "ow") and not owner:
+        return
 
+    # --- меню ---
     if d == "m:main":
         ctx.user_data.pop("st", None)
-        await edit(q, "Главное меню:", main_kb())
+        await edit(q, "Главное меню:", main_kb(uid))
+    elif d == "ow:cash":
+        sw = L.self_worker()
+        if sw:
+            await show_card(q, sw["id"])
+
+    # --- общие отчёты ---
     elif d == "rs:menu":
         await edit(q, "За какой период общий отчёт?", K(period_rows("rs")))
     elif p[0] == "rs":
         s, e = L.period_range(p[1])
-        await send_overall(ctx.bot, uid, s, e, K([menu_btn()]))
+        lab = L.label(s, e)
+        res = visible(L.calc(s, e), owner)
+        kb = K([[B("🔙 Назад", "rs:menu")], menu_btn()])
+        if not res:
+            await edit(q, f"За этот период ({lab}) отчётов нет.", kb)
+        else:
+            await show(bot, q, L.overall_text(res, lab, owner), kb)
     elif d == "rt:menu":
         await edit(q, "Рейтинг за какой период?", K(period_rows("rat")))
     elif p[0] == "rat":
         s, e = L.period_range(p[1])
-        await send(ctx.bot, uid, L.rating_text(L.calc(s, e), L.label(s, e)), K([menu_btn()]))
+        lab = L.label(s, e)
+        res = [r for r in visible(L.calc(s, e), owner) if r["n"] > 0]
+        kb = K([[B("🔙 Назад", "rt:menu")], menu_btn()])
+        if not res:
+            await edit(q, f"За этот период ({lab}) отчётов нет.", kb)
+        else:
+            await edit(q, L.rating_text(res, lab), kb)
+
+    # --- отчёт за дату ---
+    elif d == "dt:all":
+        ctx.user_data["st"] = ("dateall",)
+        await edit(q, "Напишите дату (например 11.10) или период (10.10-12.10):", K([menu_btn()]))
+    elif p[0] == "dt" and p[1] == "w":
+        if not can_see(uid, int(p[2])):
+            return
+        ctx.user_data["st"] = ("datew", int(p[2]))
+        await edit(q, "Напишите дату (например 11.10) или период (10.10-12.10):", K([menu_btn()]))
+
+    # --- кнопки под коротким отчётом ---
+    elif p[0] == "zp":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        dd = dt.date.fromisoformat(day)
+        res = L.calc(dd, dd, only=wid)
+        if res and res[0]["days"]:
+            await edit(q, L.explain(res[0], L.label(dd, dd), owner),
+                       K([[B("⬅️ Кратко", f"zb:{wid}:{day}")]]))
+        else:
+            await edit(q, "За этот день отчёта нет.")
+    elif p[0] == "zb":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        dd = dt.date.fromisoformat(day)
+        res = L.calc(dd, dd, only=wid)
+        if res and res[0]["days"]:
+            await edit(q, L.brief(res[0]), brief_kb(wid, day))
+        else:
+            await edit(q, "За этот день отчёта нет.")
+
+    # --- обработчики ---
     elif d == "w:list":
         rows = [[B(f"{w['name']} ({L.money(L.percent_on(w['id'], L.today()))}%)", f"w:{w['id']}")]
-                for w in L.workers()]
+                for w in L.workers() if not w["is_self"]]
         rows.append([B("+ Новый обработчик", "w:new")])
         rows.append(menu_btn())
         await edit(q, "Обработчики:", K(rows))
@@ -353,43 +555,134 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["st"] = ("newname",)
         await edit(q, "Напишите имя нового обработчика:", K([menu_btn()]))
     elif p[0] == "w" and p[1].isdigit():
-        await show_card(q, int(p[1]))
+        if can_see(uid, int(p[1])):
+            await show_card(q, int(p[1]))
     elif p[0] == "wp":
         ctx.user_data["st"] = ("pct", int(p[1]))
-        await edit(q, "Напишите новый процент числом (например 35):", K([menu_btn()]))
+        await edit(q, "Напишите новый процент числом (например 35).\n"
+                      "Он применится с понедельника этой недели:", K([menu_btn()]))
     elif p[0] == "adv":
         ctx.user_data["st"] = ("adv", int(p[1]))
         await edit(q, "Напишите сумму аванса в $:", K([menu_btn()]))
     elif p[0] == "wf":
         ctx.user_data["st"] = ("fine", int(p[1]))
         await edit(q, "Напишите сумму штрафа в $:", K([menu_btn()]))
+    elif p[0] == "wb":
+        ctx.user_data["st"] = ("bonus", int(p[1]))
+        await edit(q, "Напишите сумму бонуса в $:", K([menu_btn()]))
     elif p[0] == "rep":
-        s, e = L.period_range(p[1])
         wid = int(p[2])
+        if not can_see(uid, wid):
+            return
+        s, e = L.period_range(p[1])
+        lab = L.label(s, e)
         res = L.calc(s, e, only=wid)
-        if res:
-            await send(ctx.bot, uid, L.explain(res[0], L.label(s, e)))
-            await send(ctx.bot, uid, L.clean_report(res[0], L.label(s, e)))
+        back = K([[B("🔙 Карточка", f"w:{wid}")]])
+        if res and L.has_data(res[0]):
+            await show(bot, q, L.explain(res[0], lab, owner), back)
+        else:
+            await edit(q, f"За этот период ({lab}) отчётов нет.", back)
     elif p[0] == "wrep":
         ctx.user_data["st"] = ("replace", int(p[1]))
         w = L.worker(int(p[1]))
-        await edit(q, f"Кто заменяет {w['name']}? Напишите имя нового обработчика:", K([menu_btn()]))
+        await edit(q, f"Кто заменяет {w['name']} навсегда? Напишите имя нового обработчика:", K([menu_btn()]))
+
+    # --- замена на день ---
+    elif p[0] == "sub":
+        wid = int(p[1])
+        w = L.worker(wid)
+        rows = [[B(o["name"], f"sub2:{wid}:{o['id']}")] for o in L.workers()
+                if o["id"] != wid and not o["is_self"]]
+        rows.append([B("🔙 Назад", f"w:{wid}")])
+        await edit(q, f"Кто работал вместо {w['name']}?", K(rows))
+    elif p[0] == "sub2":
+        wid, w2 = int(p[1]), int(p[2])
+        days = L.worker_days(wid, 10)
+        a, b = L.worker(wid)["name"], L.worker(w2)["name"]
+        if not days:
+            await edit(q, f"У {a} нет отчётов.", K([[B("🔙 Назад", f"w:{wid}")]]))
+        else:
+            rows = [[B(f"{L.dshort(r['rd'])} ({r['n']} {L.chk_word(r['n'])})", f"sub3:{wid}:{w2}:{r['rd']}")]
+                    for r in days]
+            rows.append([B("🔙 Назад", f"w:{wid}")])
+            await edit(q, f"Отчёт {a} за какой день перенести на {b}?", K(rows))
+    elif p[0] == "sub3":
+        wid, w2, day = int(p[1]), int(p[2]), p[3]
+        a, b = L.worker(wid)["name"], L.worker(w2)["name"]
+        n = L.move_day(wid, w2, day)
+        await edit(q, f"✅ Отчёт {a} за {L.dshort(day)} ({n} {L.chk_word(n)}) перенесён на {b}.\n"
+                      f"{a} в этот день не работал.",
+                   K([[B("🔙 Карточка", f"w:{wid}")]]))
+
+    # --- исправление чеков ---
+    elif p[0] == "fx":
+        wid = int(p[1])
+        if not can_see(uid, wid):
+            return
+        days = L.worker_days(wid, 10)
+        if not days:
+            await edit(q, "Отчётов пока нет.", K([[B("🔙 Карточка", f"w:{wid}")]]))
+        else:
+            rows = [[B(f"{L.dshort(r['rd'])} ({r['n']} {L.chk_word(r['n'])})", f"fxd:{wid}:{r['rd']}")]
+                    for r in days]
+            rows.append([B("🔙 Карточка", f"w:{wid}")])
+            await edit(q, "Выберите день:", K(rows))
+    elif p[0] == "fxd":
+        await show_fx(q, int(p[1]), p[2])
+    elif p[0] == "fxc":
+        L.toggle_check(int(p[1]))
+        await show_fx(q, int(p[2]), p[3])
+    elif p[0] == "fxr":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        dd = dt.date.fromisoformat(day)
+        res = L.calc(dd, dd, only=wid)
+        back = K([[B("🔙 К чекам", f"fxd:{wid}:{day}")]])
+        if res and res[0]["days"]:
+            await show(bot, q, L.explain(res[0], L.label(dd, dd), owner), back)
+        else:
+            await edit(q, "За этот день отчёта нет.", back)
+
+    # --- прайс ---
     elif d == "pr:menu":
         await show_prices(q)
+    elif p[0] == "prm":
+        r = L.price_row(int(p[1]))
+        if not r:
+            await show_prices(q)
+        else:
+            await edit(q, f"Цена: {price_label(r)}", K([
+                [B("✏️ Изменить", f"pre:{r['id']}"), B("🗑 Удалить", f"prd:{r['id']}")],
+                [B("🔙 Прайс", "pr:menu")]
+            ]))
+    elif p[0] == "pre":
+        ctx.user_data["st"] = ("priceedit", int(p[1]))
+        await edit(q, "Напишите новую цену в $ (одно число).\n"
+                      "Или «от до цена», например: 1900 2000 8", K([menu_btn()]))
     elif p[0] == "prd":
         L.del_price(int(p[1]))
         await show_prices(q)
     elif d == "pra":
         ctx.user_data["st"] = ("priceadd",)
         await edit(q, "Напишите: «сумма цена» (например 5200 20) или «от до цена»", K([menu_btn()]))
+
+    # --- чаты ---
     elif d == "ch:menu":
         rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])),
                    f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
         rows.append(menu_btn())
-        await edit(q, "Чаты и каналы (нажмите для включения/выключения):", K(rows))
+        await edit(q, "Чаты, куда добавлен бот.\n✅ — бот читает отчёты из этого чата\n❌ — игнорирует его\n"
+                      "Нажмите на чат, чтобы включить/выключить:", K(rows))
     elif p[0] == "cw":
         L.set_watch(int(p[1]), int(p[2]))
-        await edit(q, "Статус слежения обновлён.", K([menu_btn()]))
+        rows = [[B(("✅ " if c["watch"] else "❌ ") + (c["title"] or str(c["chat_id"])),
+                   f"cw:{c['chat_id']}:{0 if c['watch'] else 1}")] for c in L.q("select * from chats")]
+        rows.append(menu_btn())
+        await edit(q, "Чаты, куда добавлен бот.\n✅ — бот читает отчёты из этого чата\n❌ — игнорирует его\n"
+                      "Нажмите на чат, чтобы включить/выключить:", K(rows))
+
+    # --- вопросы ---
     elif d == "q:list":
         pr = L.pending_reports()
         pa = L.pending_adjs()
@@ -403,8 +696,18 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ask_adj(app, aid)
     elif p[0] == "pw":
         rid, wid = int(p[1]), int(p[2])
+        r = L.report(rid)
+        if r is None:
+            await edit(q, "Отчёт уже не найден.")
+            return
         L.x("update reports set worker_id=? where id=?", (wid, rid))
-        await edit(q, f"✅ Обработчик назначен: {L.worker(wid)['name']}")
+        sender = r["sender_id"]
+        linked = ""
+        if (sender and sender not in (OWNER, ANON) and not is_staff(sender)
+                and L.user(sender) is None and r["chat_id"] != sender):
+            link_account(app, sender, wid)
+            linked = "\n🔗 Аккаунт отправителя привязан."
+        await edit(q, f"✅ Назначен: {L.worker(wid)['name']}{linked}")
         await advance(app, rid)
     elif p[0] == "pd":
         rid = int(p[1])
@@ -439,28 +742,65 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         a = L.adj(aid)
         if a:
             await edit(q, "↩️ Отменено." if a["cancelled"] else "✅ Восстановлено.", K([menu_btn()]))
-    elif p[0] == "ul":
+
+    # --- доступ, привязка аккаунтов, админы (только владелец) ---
+    elif p[0] == "lk":
         tid, wid = int(p[1]), int(p[2])
-        L.upsert_user(tid, "", "worker", wid)
-        await edit(q, f"✅ Пользователь подключен как {L.worker(wid)['name']}")
-        await send(ctx.bot, tid, "Доступ открыт! Нажмите /start", worker_menu_kb())
+        link_account(app, tid, wid)
+        await edit(q, f"✅ Аккаунт привязан к: {L.worker(wid)['name']}")
+        await send(bot, tid, "Доступ открыт! Нажмите /start", worker_menu_kb())
+    elif p[0] == "lko":
+        tid = int(p[1])
+        rows = [[B(w["name"], f"lk:{tid}:{w['id']}")] for w in L.workers()]
+        rows.append([B("🚫 Не привязывать", "lkx")])
+        await edit(q, "Выберите, кто это:", K(rows))
+    elif d == "lkx":
+        await edit(q, "Не привязано.")
+    elif p[0] == "un":
+        ctx.user_data["st"] = ("linknew", int(p[1]))
+        await edit(q, "Напишите новое имя для этого человека:", K([menu_btn()]))
     elif p[0] == "ua":
         tid = int(p[1])
-        L.upsert_user(tid, "", "admin", None)
+        L.upsert_user(tid, app.bot_data.get("names", {}).get(tid) or await tg_name(bot, tid), "admin", None)
         await edit(q, "✅ Назначен админом.")
-        await send(ctx.bot, tid, "Вам выданы права админа.", main_kb())
+        await send(bot, tid, "Вам выданы права админа. Нажмите /start")
     elif p[0] == "ux":
         await edit(q, "❌ Доступ отклонен.")
+    elif d == "adm:menu":
+        await show_admins(q)
+    elif d == "adm:new":
+        ctx.user_data["st"] = ("addadmin",)
+        await edit(q, "Напишите Telegram ID нового админа (число):", K([menu_btn()]))
+    elif p[0] == "adm" and p[1] == "add":
+        tid = int(p[2])
+        L.set_role(tid, "admin")
+        await send(bot, tid, "Вам выданы права админа. Нажмите /start")
+        await show_admins(q)
+    elif p[0] == "adm" and p[1] == "rm":
+        tid = int(p[2])
+        L.remove_admin(tid)
+        await send(bot, tid, "Права админа сняты.")
+        await show_admins(q)
+
+
+# ---------- личные сообщения ----------
+
+def parse_range(text):
+    ds = L.parse_dates(text, L.today())
+    if not ds:
+        return None
+    return min(ds), max(ds)
 
 
 async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    msg = update.message
-    if not msg or not is_staff(u.id):
+    msg = update.effective_message
+    if not msg or not u or not is_staff(u.id):
         return
     text = (msg.text or "").strip()
     app = ctx.application
     st = ctx.user_data.get("st")
+    owner = u.id == OWNER
 
     pq = app.bot_data.setdefault("pq", {})
     if pq and not st:
@@ -486,7 +826,6 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
 
     if not st:
-        # Отчёт, отправленный боту в личку
         day = msg.date.astimezone(L.TZ).date()
         if L.has_kind(text):
             items = L.parse_adjustments(text)
@@ -503,23 +842,36 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if done:
                     await confirm_adjs(app, done)
                 return
-        checks = L.parse_report(text, day)
-        if checks:
-            wid = None
-            if u.id == OWNER:
-                sw = L.self_worker()
-                wid = sw["id"] if sw else None
-            if wid is None:
-                wid = L.worker_by_name(text)
+        if L.parse_report(text, day):
             await msg.reply_text("✅ Отчёт принят, считаю...")
-            rid = L.create_report(wid, u.id, msg.message_id, u.id, text, checks)
-            await advance(app, rid)
+            await submit_report(app, u, u.id, msg.message_id, text, day, False)
             return
-        await msg.reply_text("Главное меню:", reply_markup=main_kb())
+        await msg.reply_text("Главное меню:", reply_markup=main_kb(u.id))
         return
 
     act = st[0]
-    if act == "newname":
+    if act in ("dateall", "datew"):
+        rng = parse_range(text)
+        if not rng:
+            await msg.reply_text("Не понял дату. Напишите, например: 11.10 или 10.10-12.10")
+            return
+        s, e = rng
+        ctx.user_data.pop("st", None)
+        lab = L.label(s, e)
+        kb = K([menu_btn()])
+        if act == "dateall":
+            res = visible(L.calc(s, e), owner)
+            if not res:
+                await msg.reply_text(f"За {lab} отчётов нет.", reply_markup=kb)
+            else:
+                await send(ctx.bot, u.id, L.overall_text(res, lab, owner), kb)
+        else:
+            res = L.calc(s, e, only=st[1])
+            if res and L.has_data(res[0]):
+                await send(ctx.bot, u.id, L.explain(res[0], lab, owner), kb)
+            else:
+                await msg.reply_text(f"За {lab} отчётов нет.", reply_markup=kb)
+    elif act == "newname":
         if not text:
             await msg.reply_text("Имя не может быть пустым.")
             return
@@ -535,11 +887,34 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             wid = L.add_worker(st[1], v)
         except Exception:
             ctx.user_data.pop("st", None)
-            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb())
+            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb(u.id))
             return
         ctx.user_data.pop("st", None)
         w = L.worker(wid)
         await msg.reply_text(f"✅ Добавлен обработчик: {st[1]} {L.money(v)}%", reply_markup=card_kb(w))
+    elif act == "linknew":
+        if not text:
+            await msg.reply_text("Имя не может быть пустым.")
+            return
+        ctx.user_data["st"] = ("linknewpct", st[1], text)
+        await msg.reply_text(f"Какой процент у {text}? Напишите число (например 30):")
+    elif act == "linknewpct":
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            await msg.reply_text("Введите число от 0 до 100:")
+            return
+        tid, name = st[1], st[2]
+        try:
+            wid = L.add_worker(name, v)
+        except Exception:
+            ctx.user_data.pop("st", None)
+            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb(u.id))
+            return
+        ctx.user_data.pop("st", None)
+        link_account(app, tid, wid)
+        await send(ctx.bot, tid, "Доступ открыт! Нажмите /start", worker_menu_kb())
+        await msg.reply_text(f"✅ {name} ({L.money(v)}%) добавлен и подключён.", reply_markup=main_kb(u.id))
     elif act == "pct":
         try:
             v = float(text.replace(",", "."))
@@ -548,9 +923,11 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ctx.user_data.pop("st", None)
         wid = st[1]
-        L.set_percent(wid, v, L.iso(L.today()))
+        L.set_percent(wid, v)
         w = L.worker(wid)
-        await msg.reply_text(f"✅ Процент обновлен на {L.money(v)}%", reply_markup=card_kb(w))
+        mon = L.week_start().strftime("%d.%m")
+        await msg.reply_text(f"✅ Процент {L.money(v)}% действует с понедельника ({mon}). "
+                             f"Отчёты этой недели пересчитаны.", reply_markup=card_kb(w))
     elif act == "adv":
         try:
             v = float(text.replace(",", "."))
@@ -562,7 +939,7 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         L.add_advance(wid, v, L.iso(L.today()), "Аванс")
         w = L.worker(wid)
         await msg.reply_text(f"✅ Выдан аванс: {L.money(v)}$", reply_markup=card_kb(w))
-    elif act == "fine":
+    elif act in ("fine", "bonus"):
         try:
             v = float(text.replace(",", "."))
         except ValueError:
@@ -570,9 +947,10 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ctx.user_data.pop("st", None)
         wid = st[1]
-        L.add_adj(wid, "fine", v, L.iso(L.today()), "вручную")
+        L.add_adj(wid, act, v, L.iso(L.today()), "вручную")
         w = L.worker(wid)
-        await msg.reply_text(f"✅ Штраф добавлен: {L.money(v)}$", reply_markup=card_kb(w))
+        name = "Штраф" if act == "fine" else "Бонус"
+        await msg.reply_text(f"✅ {name} добавлен: {L.money(v)}$", reply_markup=card_kb(w))
     elif act == "replace":
         if not text:
             await msg.reply_text("Имя не может быть пустым.")
@@ -583,7 +961,7 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             wid = L.add_worker(text, pct)
         except Exception:
             ctx.user_data.pop("st", None)
-            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb())
+            await msg.reply_text("Такое имя уже есть.", reply_markup=main_kb(u.id))
             return
         ctx.user_data.pop("st", None)
         L.set_active(old["id"], 0)
@@ -603,7 +981,44 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Нужно 2 или 3 числа. Пример: 5200 20")
             return
         ctx.user_data.pop("st", None)
-        await msg.reply_text("✅ Добавлено в прайс.", reply_markup=main_kb())
+        await msg.reply_text("✅ Добавлено в прайс.", reply_markup=main_kb(u.id))
+    elif act == "priceedit":
+        try:
+            nums = [float(t.replace(",", ".")) for t in text.split()]
+        except ValueError:
+            await msg.reply_text("Нужны только числа. Пример: 8")
+            return
+        row = L.price_row(st[1])
+        if not row:
+            ctx.user_data.pop("st", None)
+            await msg.reply_text("Эта цена уже удалена.", reply_markup=main_kb(u.id))
+            return
+        if len(nums) == 1:
+            L.update_price(row["id"], row["lo"], row["hi"], nums[0])
+        elif len(nums) == 2:
+            L.update_price(row["id"], int(nums[0]), int(nums[0]), nums[1])
+        elif len(nums) == 3:
+            L.update_price(row["id"], int(nums[0]), int(nums[1]), nums[2])
+        else:
+            await msg.reply_text("Нужно 1, 2 или 3 числа. Пример: 8")
+            return
+        ctx.user_data.pop("st", None)
+        await msg.reply_text("✅ Цена изменена. Чеки этой недели пересчитаны.", reply_markup=main_kb(u.id))
+    elif act == "addadmin":
+        if not text.isdigit():
+            await msg.reply_text("Нужно число (Telegram ID).")
+            return
+        tid = int(text)
+        ctx.user_data.pop("st", None)
+        if L.user(tid):
+            L.set_role(tid, "admin")
+        else:
+            L.upsert_user(tid, "", "admin", None)
+        await msg.reply_text("✅ Добавлен админ. Пусть нажмёт /start у бота.", reply_markup=main_kb(u.id))
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Ошибка: %s", ctx.error, exc_info=ctx.error)
 
 
 async def post_init(app: Application):
@@ -628,6 +1043,7 @@ def main():
     app.add_handler(MessageHandler(
         (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
         on_chat_text))
+    app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
