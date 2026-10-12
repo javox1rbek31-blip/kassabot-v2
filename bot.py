@@ -44,6 +44,24 @@ def visible(res, owner):
     return [r for r in res if L.has_data(r) and (owner or not r["w"]["is_self"])]
 
 
+def own_check(cid, wid):
+    """Chek shu ishchiga tegishlimi."""
+    return L.ql("select ch.id from checks ch join reports ro on ro.id=ch.report_id "
+                "where ch.id=? and ro.worker_id=?", (cid, wid)) is not None
+
+
+def delete_day(wid, day):
+    """Ishchining shu kundagi hamma cheklarini o'chiradi."""
+    rids = [r["rid"] for r in L.q(
+        "select distinct ch.report_id as rid from checks ch join reports ro on ro.id=ch.report_id "
+        "where ro.worker_id=? and ch.rd=?", (wid, day))]
+    L.x("delete from checks where rd=? and report_id in (select id from reports where worker_id=?)", (day, wid))
+    for rid in rids:
+        if not L.ql("select 1 from checks where report_id=?", (rid,)):
+            L.x("delete from reports where id=?", (rid,))
+    return len(rids)
+
+
 def menu_btn():
     return [B("🔙 Меню", "m:main")]
 
@@ -116,7 +134,7 @@ def worker_menu_kb():
 # ---------- отчёты ----------
 
 def brief_kb(wid, day):
-    return K([[B("💰 Посчитать ЗП", f"zp:{wid}:{day}")]])
+    return K([[B("💰 Посчитать ЗП", f"zp:{wid}:{day}"), B("🗑 Удалить", f"dl:{wid}:{day}")]])
 
 
 async def finalize(app, rid):
@@ -137,6 +155,14 @@ async def finalize(app, rid):
             await send(app.bot, sid, text, brief_kb(wid, d))
 
 
+def asker(r):
+    """Savolni kimga yuborish: shaxsiy chatda tashlagan admin o'ziga, qolgan hammasi egaga."""
+    s = r["sender_id"]
+    if s and r["chat_id"] == s and is_staff(s):
+        return s
+    return OWNER
+
+
 async def advance(app, rid):
     need = L.report_needs(rid)
     r = L.report(rid)
@@ -147,17 +173,19 @@ async def advance(app, rid):
         return
     kind, arg = need
     snippet = (r["raw"] or "")[:350]
+    to = asker(r)
     if kind == "worker":
-        rows = [[B(w["name"], f"pw:{rid}:{w['id']}")] for w in L.workers()]
+        rows = [[B(w["name"], f"pw:{rid}:{w['id']}")] for w in L.workers()
+                if to == OWNER or not w["is_self"]]
         rows.append([B("❌ Это не отчёт", f"pwi:{rid}")])
-        await send(app.bot, OWNER, f"❓ Кто это отправил?\n\n{snippet}", K(rows))
+        await send(app.bot, to, f"❓ Кто это отправил?\n\n{snippet}", K(rows))
     elif kind == "date":
         t = L.today()
         ds = [t - dt.timedelta(days=i) for i in range(4)]
         rows = [[B(d.strftime("%d.%m"), f"pd:{rid}:{d.isoformat()}")] for d in ds]
         rows.append([B("❌ Это не отчёт", f"pwi:{rid}")])
         name = L.worker(r["worker_id"])["name"]
-        await send(app.bot, OWNER, f"❓ {name}: на какой день этот отчёт?", K(rows))
+        await send(app.bot, to, f"❓ {name}: на какой день этот отчёт?", K(rows))
     elif kind == "price":
         name = L.worker(r["worker_id"])["name"]
         m = await send(app.bot, OWNER, f"❓ {name}: сколько стоит чек {arg:,}? Ответьте числом.")
@@ -228,7 +256,8 @@ async def ask_link(app, uid, name, wid):
 
 
 async def submit_report(app, u, chat_id, msg_id, text, day, strict):
-    """Hisobotni qabul qiladi. strict=True (guruh/kanal): sanasi bo'lmagan xabar hisobot emas."""
+    """strict=True (guruh/kanal): sanasiz xabar hisobot emas.
+    strict=False (botning shaxsiy chati): ism yozilmagan bo'lsa, kimniki ekanini so'raydi."""
     checks = L.parse_report(text, day)
     if not checks:
         return False
@@ -237,7 +266,10 @@ async def submit_report(app, u, chat_id, msg_id, text, day, strict):
     uid = u.id if u else None
     if u:
         app.bot_data.setdefault("names", {})[uid] = u.full_name
-    wid, by_name = detect_worker(uid, text)
+    if strict:
+        wid, by_name = detect_worker(uid, text)
+    else:
+        wid, by_name = L.worker_by_name(text), False
     rid = L.create_report(wid, chat_id, msg_id, uid, text, checks)
     if by_name and uid and uid != ANON and not is_staff(uid) and not L.user(uid):
         await ask_link(app, uid, u.full_name, wid)
@@ -398,7 +430,9 @@ async def show_fx(q, wid, day):
             row = []
     if row:
         kb.append(row)
+    kb.append([B("📅 Изменить дату чека", f"fxm:{wid}:{day}")])
     kb.append([B("📊 Показать разбор", f"fxr:{wid}:{day}")])
+    kb.append([B("🗑 Удалить весь день", f"dl:{wid}:{day}")])
     kb.append([B("🔙 Карточка", f"w:{wid}")])
     await edit(q, f"✏️ {w['name']} — {L.dshort(day)}\nЗасчитано: {used} из {len(cs)}\n"
                   f"Нажмите на чек, чтобы исключить 🚫 или вернуть ✅:", K(kb))
@@ -531,7 +565,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         res = L.calc(dd, dd, only=wid)
         if res and res[0]["days"]:
             await edit(q, L.explain(res[0], L.label(dd, dd), owner),
-                       K([[B("⬅️ Кратко", f"zb:{wid}:{day}")]]))
+                       K([[B("⬅️ Кратко", f"zb:{wid}:{day}"), B("🗑 Удалить", f"dl:{wid}:{day}")]]))
         else:
             await edit(q, "За этот день отчёта нет.")
     elif p[0] == "zb":
@@ -544,6 +578,23 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await edit(q, L.brief(res[0]), brief_kb(wid, day))
         else:
             await edit(q, "За этот день отчёта нет.")
+
+    # --- удаление отчёта за день ---
+    elif p[0] == "dl":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        w = L.worker(wid)
+        await edit(q, f"🗑 Удалить отчёт {w['name']} за {L.dshort(day)}?\nВсе чеки этого дня будут удалены.",
+                   K([[B("✅ Да, удалить", f"dy:{wid}:{day}")],
+                      [B("↩️ Отмена", f"zb:{wid}:{day}")]]))
+    elif p[0] == "dy":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        w = L.worker(wid)
+        delete_day(wid, day)
+        await edit(q, f"🗑 Отчёт {w['name']} за {L.dshort(day)} удалён.", K([menu_btn()]))
 
     # --- обработчики ---
     elif d == "w:list":
@@ -629,10 +680,13 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rows.append([B("🔙 Карточка", f"w:{wid}")])
             await edit(q, "Выберите день:", K(rows))
     elif p[0] == "fxd":
-        await show_fx(q, int(p[1]), p[2])
+        if can_see(uid, int(p[1])):
+            await show_fx(q, int(p[1]), p[2])
     elif p[0] == "fxc":
-        L.toggle_check(int(p[1]))
-        await show_fx(q, int(p[2]), p[3])
+        cid, wid = int(p[1]), int(p[2])
+        if can_see(uid, wid) and own_check(cid, wid):
+            L.toggle_check(cid)
+            await show_fx(q, wid, p[3])
     elif p[0] == "fxr":
         wid, day = int(p[1]), p[2]
         if not can_see(uid, wid):
@@ -644,6 +698,59 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show(bot, q, L.explain(res[0], L.label(dd, dd), owner), back)
         else:
             await edit(q, "За этот день отчёта нет.", back)
+
+    # --- изменить дату чека ---
+    elif p[0] == "fxm":
+        wid, day = int(p[1]), p[2]
+        if not can_see(uid, wid):
+            return
+        cs = L.day_checks(wid, day)
+        kb, row = [], []
+        for c in cs:
+            row.append(B(str(c["amount"]), f"fxm2:{c['id']}:{wid}:{day}"))
+            if len(row) == 3:
+                kb.append(row)
+                row = []
+        if row:
+            kb.append(row)
+        kb.append([B("🔙 Назад", f"fxd:{wid}:{day}")])
+        await edit(q, f"📅 {L.dshort(day)}: у какого чека изменить дату?", K(kb))
+    elif p[0] == "fxm2":
+        cid, wid, day = int(p[1]), int(p[2]), p[3]
+        if not can_see(uid, wid) or not own_check(cid, wid):
+            return
+        c = L.ql("select amount from checks where id=?", (cid,))
+        t = L.today()
+        rows, row = [], []
+        for i in range(6):
+            dy = (t - dt.timedelta(days=i)).isoformat()
+            if dy == day:
+                continue
+            row.append(B(L.dshort(dy), f"fxm3:{cid}:{dy}:{wid}:{day}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([B("✍️ Другая дата", f"fxmt:{cid}:{wid}:{day}")])
+        rows.append([B("🔙 Назад", f"fxm:{wid}:{day}")])
+        await edit(q, f"Чек {c['amount']} сейчас на {L.dshort(day)}.\nНа какую дату перенести?", K(rows))
+    elif p[0] == "fxm3":
+        cid, newday, wid, day = int(p[1]), p[2], int(p[3]), p[4]
+        if not can_see(uid, wid) or not own_check(cid, wid):
+            return
+        c = L.ql("select amount from checks where id=?", (cid,))
+        L.x("update checks set rd=? where id=?", (newday, cid))
+        await edit(q, f"✅ Чек {c['amount']} перенесён: {L.dshort(day)} → {L.dshort(newday)}",
+                   K([[B(f"📋 Чеки {L.dshort(newday)}", f"fxd:{wid}:{newday}")],
+                      [B(f"📋 Чеки {L.dshort(day)}", f"fxd:{wid}:{day}")],
+                      [B("🔙 Карточка", f"w:{wid}")]]))
+    elif p[0] == "fxmt":
+        cid, wid, day = int(p[1]), int(p[2]), p[3]
+        if not can_see(uid, wid) or not own_check(cid, wid):
+            return
+        ctx.user_data["st"] = ("chkdate", cid, wid, day)
+        await edit(q, "Напишите правильную дату (например 10.10):", K([menu_btn()]))
 
     # --- прайс ---
     elif d == "pr:menu":
@@ -839,14 +946,30 @@ async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await confirm_adjs(app, done)
                 return
         if L.parse_report(text, day):
-            await msg.reply_text("✅ Отчёт принят, считаю...")
             await submit_report(app, u, u.id, msg.message_id, text, day, False)
             return
         await msg.reply_text("Главное меню:", reply_markup=main_kb(u.id))
         return
 
     act = st[0]
-    if act in ("dateall", "datew"):
+    if act == "chkdate":
+        cid, wid, oldday = st[1], st[2], st[3]
+        ds = L.parse_dates(text, L.today())
+        if not ds:
+            await msg.reply_text("Не понял дату. Напишите, например: 10.10")
+            return
+        ctx.user_data.pop("st", None)
+        if not can_see(u.id, wid) or not own_check(cid, wid):
+            await msg.reply_text("Чек не найден.", reply_markup=main_kb(u.id))
+            return
+        newday = L.iso(ds[0])
+        c = L.ql("select amount from checks where id=?", (cid,))
+        L.x("update checks set rd=? where id=?", (newday, cid))
+        await msg.reply_text(
+            f"✅ Чек {c['amount']} перенесён: {L.dshort(oldday)} → {L.dshort(newday)}",
+            reply_markup=K([[B(f"📋 Чеки {L.dshort(newday)}", f"fxd:{wid}:{newday}")],
+                            [B("🔙 Карточка", f"w:{wid}")]]))
+    elif act in ("dateall", "datew"):
         rng = parse_range(text)
         if not rng:
             await msg.reply_text("Не понял дату. Напишите, например: 11.10 или 10.10-12.10")
