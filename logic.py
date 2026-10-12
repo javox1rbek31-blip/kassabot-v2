@@ -18,7 +18,16 @@ def iso(d):
     return d.isoformat()
 
 
+def week_start(d=None):
+    d = d or today()
+    return d - dt.timedelta(days=d.weekday())
+
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT
+);
 CREATE TABLE IF NOT EXISTS workers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
@@ -63,7 +72,8 @@ CREATE TABLE IF NOT EXISTS checks (
     report_id INTEGER NOT NULL,
     rd TEXT,
     amount INTEGER NOT NULL,
-    usd REAL
+    usd REAL,
+    skip INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS adj (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +107,7 @@ SEED_PRICES = [
 ]
 
 SEED_WORKERS = [
-    ("Cashliy", 1, 1),
+    ("Cashliy", 50, 1),
     ("Bayzed", 41, 0),
     ("Cred", 36, 0),
     ("Lazarus", 30, 0),
@@ -105,6 +115,21 @@ SEED_WORKERS = [
 ]
 
 _db = None
+
+
+def _migrate(c):
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(checks)")]
+    if "skip" not in cols:
+        c.execute("ALTER TABLE checks ADD COLUMN skip INTEGER NOT NULL DEFAULT 0")
+    # Bir martalik: eski (test) hisobotlarni tozalash va Cashliy = 50%
+    if not c.execute("select 1 from meta where k='reset_v3'").fetchone():
+        for t in ("checks", "reports", "adj", "advances"):
+            c.execute(f"delete from {t}")
+        s = c.execute("select id from workers where is_self=1").fetchone()
+        if s:
+            c.execute("delete from pct where worker_id=?", (s["id"],))
+            c.execute("insert into pct values (?,?,?)", (s["id"], "2000-01-01", 50))
+        c.execute("insert into meta values ('reset_v3','1')")
 
 
 def db():
@@ -124,6 +149,7 @@ def db():
                 _db.execute("insert into pct values (?,?,?)", (cur.lastrowid, "2000-01-01", p))
         if not _db.execute("select 1 from prices").fetchone():
             _db.executemany("insert into prices (lo, hi, usd) values (?,?,?)", SEED_PRICES)
+        _migrate(_db)
         _db.commit()
     return _db
 
@@ -141,6 +167,8 @@ def x(sql, args=()):
     db().commit()
     return cur
 
+
+# ---------- workers ----------
 
 def workers(active_only=True):
     sql = "select * from workers" + (" where active=1" if active_only else "")
@@ -167,12 +195,12 @@ def add_worker(name, percent, from_day="2000-01-01"):
     return cur.lastrowid
 
 
-def set_percent(wid, percent, from_day):
-    x("insert or replace into pct values (?,?,?)", (wid, from_day, percent))
-
-
-def rename_worker(wid, name):
-    x("update workers set name=? where id=?", (name.strip(), wid))
+def set_percent(wid, percent):
+    """Foiz shu haftaning dushanbasidan boshlab o'zgaradi."""
+    mon = iso(week_start())
+    x("delete from pct where worker_id=? and from_day>=?", (wid, mon))
+    has = ql("select 1 from pct where worker_id=?", (wid,))
+    x("insert into pct values (?,?,?)", (wid, mon if has else "2000-01-01", percent))
 
 
 def set_active(wid, v):
@@ -186,6 +214,8 @@ def worker_by_name(text):
             return w["id"]
     return None
 
+
+# ---------- users ----------
 
 def user(tg_id):
     return ql("select * from users where tg_id=?", (tg_id,))
@@ -201,6 +231,10 @@ def admins():
     return [r["tg_id"] for r in q("select tg_id from users where role='admin'")]
 
 
+def all_users():
+    return q("select * from users order by role, tg_id")
+
+
 def users_of_worker(wid):
     return q("select * from users where worker_id=?", (wid,))
 
@@ -208,6 +242,18 @@ def users_of_worker(wid):
 def set_role(tg_id, role):
     x("update users set role=? where tg_id=?", (role, tg_id))
 
+
+def remove_admin(tg_id):
+    u = user(tg_id)
+    if not u:
+        return
+    if u["worker_id"]:
+        x("update users set role='worker' where tg_id=?", (tg_id,))
+    else:
+        x("delete from users where tg_id=?", (tg_id,))
+
+
+# ---------- chats ----------
 
 def chat(cid):
     return ql("select * from chats where chat_id=?", (cid,))
@@ -222,18 +268,15 @@ def set_watch(cid, v):
     x("update chats set watch=? where chat_id=?", (v, cid))
 
 
+# ---------- prices ----------
+
 def price_for(amount):
     r = ql("select usd from prices where lo<=? and hi>=? order by (hi-lo) asc limit 1", (amount, amount))
     return r["usd"] if r else None
 
 
-def add_price(lo, hi, usd):
-    x("insert into prices (lo, hi, usd) values (?,?,?)", (min(lo, hi), max(lo, hi), usd))
-    refresh_prices()
-
-
-def del_price(pid):
-    x("delete from prices where id=?", (pid,))
+def price_row(pid):
+    return ql("select * from prices where id=?", (pid,))
 
 
 def list_prices():
@@ -247,10 +290,40 @@ def refresh_prices():
             x("update checks set usd=? where id=?", (p, c["id"]))
 
 
+def reprice_week():
+    """Narx o'zgarsa, shu haftaning dushanbasidan boshlab chek narxlari qayta hisoblanadi."""
+    mon = iso(week_start())
+    rows = [(price_for(c["amount"]), c["id"]) for c in q("select id, amount from checks where rd>=?", (mon,))]
+    if rows:
+        db().executemany("update checks set usd=? where id=?", rows)
+        db().commit()
+
+
+def add_price(lo, hi, usd):
+    x("insert into prices (lo, hi, usd) values (?,?,?)", (min(lo, hi), max(lo, hi), usd))
+    refresh_prices()
+    reprice_week()
+
+
+def update_price(pid, lo, hi, usd):
+    x("update prices set lo=?, hi=?, usd=? where id=?", (min(lo, hi), max(lo, hi), usd, pid))
+    refresh_prices()
+    reprice_week()
+
+
+def del_price(pid):
+    x("delete from prices where id=?", (pid,))
+    reprice_week()
+
+
+# ---------- parsing ----------
+
 RD_FIND = re.compile(r"(?<![A-Za-zА-Яа-я])(?:rd|рд)\W{0,3}(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", re.I)
 DATE_RE = re.compile(r"(?<!\d)\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?!\d)")
+DATE_G = re.compile(r"(?<!\d)(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?!\d)")
 TIME_RE = re.compile(r"\d{1,2}:\d{2}")
-NUM_RE = re.compile(r"(?<!\d)(\d{1,2}(?:,\d{3})+|\d{3,6})(?!\d)")
+# 1950, 1,950, 1.950, 1 950, 12 500
+NUM_RE = re.compile(r"(?<!\d)(\d{1,2}(?:[ .,\u00a0]\d{3})+|\d{3,6})(?!\d)")
 TOTAL_RE = re.compile(r"итого|всего|jami|umumiy|total|касса|kassa|сумма|зп\b|зарплата", re.I)
 
 
@@ -274,6 +347,23 @@ def find_rd(line, ref=None):
     return mk_date(m.group(1), m.group(2), m.group(3), ref) if m else None
 
 
+def find_date(line, ref=None):
+    for m in DATE_G.finditer(line):
+        d = mk_date(m.group(1), m.group(2), m.group(3), ref)
+        if d:
+            return d
+    return None
+
+
+def parse_dates(text, ref=None):
+    out = []
+    for m in DATE_G.finditer(text):
+        d = mk_date(m.group(1), m.group(2), m.group(3), ref)
+        if d:
+            out.append(d)
+    return out
+
+
 def has_rd(text):
     return bool(RD_FIND.search(text))
 
@@ -281,6 +371,8 @@ def has_rd(text):
 def parse_report(text, ref=None):
     lines = text.splitlines()
     rds = [find_rd(l, ref) for l in lines]
+    if not any(rds):
+        rds = [find_date(l, ref) for l in lines]
     first = next((r for r in rds if r), None)
     cur, out = None, []
     for line, rd in zip(lines, rds):
@@ -333,6 +425,8 @@ def parse_adjustments(text):
     return items
 
 
+# ---------- reports ----------
+
 def report(rid):
     return ql("select * from reports where id=?", (rid,))
 
@@ -377,6 +471,59 @@ def report_days(rid):
     return [r["rd"] for r in q("select distinct rd from checks where report_id=?", (rid,)) if r["rd"]]
 
 
+def replace_old(rid):
+    """Shu ishchining shu kunlar uchun eski hisobotlarini o'chiradi: yangisi eskisini almashtiradi."""
+    r = report(rid)
+    if r is None or r["worker_id"] is None:
+        return []
+    replaced = []
+    for d in report_days(rid):
+        olds = q("select distinct ch.report_id as rid from checks ch join reports ro on ro.id=ch.report_id "
+                 "where ro.worker_id=? and ch.rd=? and ch.report_id<>?", (r["worker_id"], d, rid))
+        for o in olds:
+            x("delete from checks where report_id=? and rd=?", (o["rid"], d))
+            if not ql("select 1 from checks where report_id=?", (o["rid"],)):
+                x("delete from reports where id=?", (o["rid"],))
+        if olds:
+            replaced.append(d)
+    return replaced
+
+
+def worker_days(wid, limit=10):
+    return q("select ch.rd as rd, count(*) as n from checks ch join reports ro on ro.id=ch.report_id "
+             "where ro.worker_id=? and ch.rd is not null group by ch.rd order by ch.rd desc limit ?",
+             (wid, limit))
+
+
+def day_checks(wid, day):
+    return q("select ch.id, ch.amount, ch.usd, ch.skip from checks ch join reports ro on ro.id=ch.report_id "
+             "where ro.worker_id=? and ch.rd=? order by ch.id", (wid, day))
+
+
+def toggle_check(cid):
+    x("update checks set skip=1-skip where id=?", (cid,))
+
+
+def move_day(from_wid, to_wid, day):
+    """from_wid ning shu kundagi hisobotini to_wid ga o'tkazadi (from_wid o'sha kuni ishlamagan)."""
+    rids = [r["rid"] for r in q(
+        "select distinct ch.report_id as rid from checks ch join reports ro on ro.id=ch.report_id "
+        "where ro.worker_id=? and ch.rd=?", (from_wid, day))]
+    moved = 0
+    for rid in rids:
+        r = report(rid)
+        cur = x("insert into reports (worker_id, chat_id, msg_id, sender_id, raw, status, created) "
+                "values (?,?,?,?,?,?,?)",
+                (to_wid, r["chat_id"], None, r["sender_id"], r["raw"], r["status"], dt.datetime.now(TZ).isoformat()))
+        cur2 = x("update checks set report_id=? where report_id=? and rd=?", (cur.lastrowid, rid, day))
+        moved += cur2.rowcount
+        if not ql("select 1 from checks where report_id=?", (rid,)):
+            x("delete from reports where id=?", (rid,))
+    return moved
+
+
+# ---------- adjustments / advances ----------
+
 def add_adj(worker_id, kind, usd, day, raw, chat_id=None, msg_id=None, pending=0):
     return x("insert into adj (worker_id, kind, usd, day, raw, chat_id, msg_id, pending) values (?,?,?,?,?,?,?,?)",
              (worker_id, kind, usd, day, raw, chat_id, msg_id, pending)).lastrowid
@@ -410,10 +557,6 @@ def pending_adjs():
     return [r["id"] for r in q("select id from adj where pending=1")]
 
 
-def worker_adjs(wid, limit=15):
-    return q("select * from adj where worker_id=? and pending=0 order by id desc limit ?", (wid, limit))
-
-
 def add_advance(worker_id, usd, day, note=""):
     return x("insert into advances (worker_id, usd, day, note) values (?,?,?,?)",
              (worker_id, usd, day, note)).lastrowid
@@ -425,6 +568,8 @@ def worker_advances(wid, start, end):
     return r["total"] or 0.0
 
 
+# ---------- periods & calc ----------
+
 def period_range(key):
     t = today()
     if key == "td":
@@ -433,10 +578,9 @@ def period_range(key):
         y = t - dt.timedelta(days=1)
         return y, y
     if key == "tw":
-        mon = t - dt.timedelta(days=t.weekday())
-        return mon, t
+        return week_start(t), t
     if key == "lw":
-        mon = t - dt.timedelta(days=t.weekday() + 7)
+        mon = week_start(t) - dt.timedelta(days=7)
         return mon, mon + dt.timedelta(days=6)
     if key == "tm":
         return t.replace(day=1), t
@@ -453,8 +597,8 @@ def calc(start, end, only=None):
         if only and w["id"] != only:
             continue
         rows = q("select ch.rd, ch.amount, ch.usd from checks ch join reports ro on ro.id=ch.report_id "
-                 "where ro.worker_id=? and ro.status='done' and ch.rd between ? and ? order by ch.rd, ch.id",
-                 (w["id"], s, e))
+                 "where ro.worker_id=? and ro.status='done' and ch.skip=0 and ch.rd between ? and ? "
+                 "order by ch.rd, ch.id", (w["id"], s, e))
         adjs = q("select * from adj where worker_id=? and cancelled=0 and pending=0 and day between ? and ?",
                  (w["id"], s, e))
         adv = worker_advances(w["id"], start, end)
@@ -478,10 +622,16 @@ def calc(start, end, only=None):
         out.append({
             "w": w, "days": dinfo, "n": len(rows), "raw": sum(d["raw"] for d in dinfo),
             "usd": round(usd_all, 2), "zp": round(zp, 2), "fines": fines, "bonuses": bonuses,
-            "fine": fs, "bonus": bs, "adv": adv, "total": total, "profit": usd_all / 2
+            "fine": fs, "bonus": bs, "adv": adv, "total": total
         })
     return out
 
+
+def has_data(r):
+    return r["n"] > 0 or bool(r["fines"]) or bool(r["bonuses"]) or r["adv"] > 0
+
+
+# ---------- text ----------
 
 def money(v):
     v = round(v + 1e-9, 2)
@@ -515,76 +665,116 @@ def adj_list(items):
     return f"{v}$"
 
 
-def salary_lines(r):
-    lines = [
-        f"Зп: {money(r['zp'])}$",
-        f"Штраф: {adj_list(r['fines']) if r['fines'] else '0$'}",
-        f"Бонус: {adj_list(r['bonuses']) if r['bonuses'] else '0$'}"
-    ]
+def adj_lines(r):
+    """Штраф / Бонус / Аванс / Итого — faqat 0 dan katta bo'lsa."""
+    out = []
+    if r["fines"]:
+        out.append(f"Штраф: {adj_list(r['fines'])}")
+    if r["bonuses"]:
+        out.append(f"Бонус: {adj_list(r['bonuses'])}")
     if r["adv"] > 0:
-        lines.append(f"Аванс: {money(r['adv'])}$")
-    lines.append(f"Итого: {money(r['zp'])}-{money(r['fine'])}+{money(r['bonus'])}-{money(r['adv'])}={money(r['total'])}$")
-    return lines
+        out.append(f"Аванс: {money(r['adv'])}$")
+    if out:
+        f = money(r["zp"])
+        if r["fines"]:
+            f += f"-{money(r['fine'])}"
+        if r["bonuses"]:
+            f += f"+{money(r['bonus'])}"
+        if r["adv"] > 0:
+            f += f"-{money(r['adv'])}"
+        out.append(f"Итого: {f}={money(r['total'])}$")
+    return out
 
 
-def worker_text(r, lab):
-    return "\n".join([f"{r['w']['name']} ({lab})"] + salary_lines(r))
-
-
-def clean_report(r, lab):
-    lines = [f"{r['w']['name']} ({lab})"]
-    if r["n"] == 0:
-        lines.append("Чеков нет")
-    for d in r["days"]:
-        am = [a for a, _ in d["items"]]
-        lines.append(f"Дата: {dshort(d['day'])} | Чеки: {', '.join(map(str, am))}")
-        lines.append("Касса: " + " + ".join(map(str, am)) + f" = {n3(d['raw'])}")
-        lines.append("")
-    lines += salary_lines(r)
+def brief(r, updated=False):
+    """Qisqa kunlik xabar."""
+    d = r["days"][0]
+    lines = []
+    if updated:
+        lines.append("♻️ Отчёт обновлён (старый заменён)")
+    lines += [
+        r["w"]["name"],
+        f"Дата: {dshort(d['day'])}",
+        f"Касса: {n3(d['raw'])}",
+        f"Кол-во рд: {len(d['items'])}",
+    ]
     return "\n".join(lines)
 
 
-def explain(r, lab):
-    out = [f"Разбор: {r['w']['name']} ({lab})", "Каждый чек переводится в $ по прайсу:"]
-    if r["n"] == 0:
-        out.append("Чеков за период нет.")
+def worker_report(r, lab):
+    """Ishchi o'zi ko'radigan hisobot (faqat zp)."""
+    out = [f"{r['w']['name']} ({lab})"]
     for d in r["days"]:
-        out.append(f"Дата {dshort(d['day'])}:")
+        out.append(f"{dshort(d['day'])}: касса {n3(d['raw'])}, рд {len(d['items'])}")
+    out.append(f"Зп: {money(r['zp'])}$")
+    out += adj_lines(r)
+    return "\n".join(out)
+
+
+def explain(r, lab, owner=False):
+    """Razbor: faqat admin va egaga."""
+    out = [f"Разбор: {r['w']['name']} ({lab})"]
+    if not r["days"]:
+        out.append("Чеков нет.")
+    for d in r["days"]:
+        out.append("")
+        out.append(f"📅 {dshort(d['day'])} — кол-во рд: {len(d['items'])}")
         cnt = OrderedDict()
         for a, u in d["items"]:
             cnt[(a, u)] = cnt.get((a, u), 0) + 1
         for (a, u), k in cnt.items():
-            out.append(f"  {a} x{k} = {money(u * k)}$")
-        out.append(f"  Сумма кассы: {n3(d['raw'])} → по прайсу {money(d['usd'])}$")
-        out.append(f"  Зп за день: {money(d['usd'])}$ * {money(d['pct'])}% = {money(d['usd'] * d['pct'] / 100)}$")
-    if r["n"]:
-        out += ["", f"Касса по прайсу: {money(r['usd'])}$", f"Зп всего: {money(r['zp'])}$"]
-    if r["fines"]:
-        out.append("Штраф: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["fines"]))
-    if r["bonuses"]:
-        out.append("Бонус: " + ", ".join(f"{money(a)}$ ({dshort(dd)})" for a, dd in r["bonuses"]))
-    if r["adv"] > 0:
-        out.append(f"Аванс: {money(r['adv'])}$")
-    out.append(f"Итого: {money(r['zp'])}-{money(r['fine'])}+{money(r['bonus'])}-{money(r['adv'])}={money(r['total'])}$")
+            if u == 0:
+                out.append(f"{a} = ❓ нет цены")
+            elif k > 1:
+                out.append(f"{a} = {money(u)}$ × {k} = {money(u * k)}$")
+            else:
+                out.append(f"{a} = {money(u)}$")
+        out.append("Касса: " + " + ".join(str(a) for a, _ in d["items"]) + f" = {n3(d['raw'])}")
+        out.append(f"По прайсу: {money(d['usd'])}$")
+        out.append(f"Зп: {money(d['usd'])}$ × {money(d['pct'])}% = {money(d['usd'] * d['pct'] / 100)}$")
+    if len(r["days"]) > 1:
+        out.append("")
+        out.append(f"Зп за период: {money(r['zp'])}$")
+    extra = adj_lines(r)
+    if extra:
+        out.append("")
+        out += extra
+    if owner and r["n"] and not r["w"]["is_self"]:
+        out.append("")
+        out.append(f"💼 Ваша доля: {money(r['usd'])}$ − {money(r['zp'])}$ = {money(r['usd'] - r['zp'])}$")
     return "\n".join(out)
 
 
-def overall_text(res, lab):
+def overall_text(res, lab, owner=False):
     out = [f"📊 Общий отчёт ({lab})", ""]
-    tot_n, tot_usd, tot_raw = 0, 0.0, 0
+    tn, traw, tusd = 0, 0, 0.0
     for r in res:
         n = r["n"]
-        tot_n += n
-        tot_usd += r["usd"]
-        tot_raw += r["raw"]
+        tn += n
+        traw += r["raw"]
+        tusd += r["usd"]
         out.append(f"{r['w']['name']}: {n} {chk_word(n)}, касса {n3(r['raw'])}, зп {money(r['total'])}$")
-    out += ["", f"Всего чеков: {tot_n}", f"Касса (сумма чеков): {n3(tot_raw)}",
-            f"Касса ($): {money(tot_usd)}$", f"Чистая прибыль: {money(tot_usd / 2)}$"]
+    out += ["", f"Всего чеков: {tn}", f"Касса: {n3(traw)}", f"Касса ($): {money(tusd)}$"]
+    if owner:
+        parts = []
+        out += ["", "💼 Ваш доход:"]
+        for r in res:
+            if not r["n"]:
+                continue
+            if r["w"]["is_self"]:
+                mine = r["zp"]
+                out.append(f"{r['w']['name']} (своя касса): {money(r['usd'])}$ × {money(r['days'][0]['pct'])}% = {money(mine)}$")
+            else:
+                mine = r["usd"] - r["zp"]
+                out.append(f"{r['w']['name']}: {money(r['usd'])}$ − {money(r['zp'])}$ = {money(mine)}$")
+            parts.append(mine)
+        if parts:
+            out.append("Итого ваш доход: " + " + ".join(money(p) for p in parts) + f" = {money(sum(parts))}$")
     return "\n".join(out)
 
 
 def rating_text(res, lab):
-    rows = sorted([r for r in res if r["w"]["active"] or r["n"]], key=lambda r: r["usd"], reverse=True)
+    rows = sorted([r for r in res if r["n"] > 0], key=lambda r: r["usd"], reverse=True)
     medal = ["🥇", "🥈", "🥉"]
     out = [f"🏆 Рейтинг кассы ({lab})", ""]
     for i, r in enumerate(rows):
