@@ -587,6 +587,28 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ваш ID: {update.effective_user.id}")
 
 
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Yangi botga ko'chirish: butun kassa bazasining nusxasi (faqat egaga, shaxsiy chatda)."""
+    uid = update.effective_user.id if update.effective_user else None
+    if update.effective_chat.type != "private" or not is_owner(uid):
+        return
+    import sqlite3
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "kassa_export.db")
+    L.db().commit()
+    dst = sqlite3.connect(tmp)
+    try:
+        L.db().backup(dst)
+    finally:
+        dst.close()
+    try:
+        with open(tmp, "rb") as f:
+            await ctx.bot.send_document(uid, document=f, filename="kassa.db",
+                                        caption="kassa.db — yangi botga yuboring: ⚙️ Sozlamalar → 📥 Ko'chirish")
+    finally:
+        os.remove(tmp)
+
+
 # ───────────────────────── tugmalar (hammasi o'sha xabarning o'zida) ─────────────────────────
 def payee_rows(uid, prefix, back, include_owner_btn=False, wid=None):
     rows = [[B(w["name"], f"{prefix}:{w['id']}")] for w in vis(uid, ("worker", "self"))]
@@ -1448,6 +1470,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
